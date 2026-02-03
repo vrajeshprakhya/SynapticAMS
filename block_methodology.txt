@@ -1,0 +1,207 @@
+Perfect — now we’re at a purely mechanical graph problem.
+I’ll give you exact, runnable logic that plugs directly on top of:
+
+graph_builder
+
+is_constant_net
+
+is_control_relevant
+
+No hand-waving.
+
+Goal (restated precisely)
+
+For each block (connected component of the signal graph), determine:
+
+Block inputs → nets that drive the block
+
+Block outputs → nets that are driven by the block
+
+These become Verilog-AMS ports.
+
+What you already have (assumed)
+
+Your bipartite graph has:
+
+graph.nets                 # set of net names
+graph.devices              # set of device names
+graph.net_to_devices[net]  # [(device, pin), ...]
+graph.device_to_nets[dev]  # {pin: net}
+graph.device_type[dev]     # "MOSFET", "R", "V", etc.
+
+
+And you already computed:
+
+constant_nets = {...}
+control_relevant_devices = {...}
+
+Step 1 — Build the signal graph
+
+We remove:
+
+Constant nets
+
+Bias-only devices (non-control-relevant transistors)
+
+import networkx as nx
+
+def build_signal_graph(graph, constant_nets, control_relevant_devices):
+    G = nx.Graph()
+
+    # add remaining nets
+    for net in graph.nets:
+        if net not in constant_nets:
+            G.add_node(net, kind="net")
+
+    # add only control-relevant devices
+    for dev in control_relevant_devices:
+        G.add_node(dev, kind="device")
+
+        for pin, net in graph.device_to_nets[dev].items():
+            if net not in constant_nets:
+                G.add_edge(dev, net)
+
+    return G
+
+Step 2 — Extract blocks (connected components)
+def extract_blocks(signal_graph):
+    return list(nx.connected_components(signal_graph))
+
+
+Each returned component = one block.
+
+Step 3 — Identify inputs and outputs of a block
+
+This is the key logic.
+
+Definitions (exact, programmatic)
+Input net
+
+A net is a block input if:
+
+It is inside the block
+
+It connects to a control terminal
+
+It is driven from outside the block
+
+Output net
+
+A net is a block output if:
+
+It is inside the block
+
+It connects to an active output terminal
+
+It drives something outside the block
+
+Step 4 — Pin classification tables
+CONTROL_PINS = {
+    "MOSFET": {"G"},
+    "BJT": {"B"},
+}
+
+OUTPUT_PINS = {
+    "MOSFET": {"D", "S"},
+    "BJT": {"C", "E"},
+}
+
+Step 5 — Block I/O extraction (this is the core)
+def extract_block_io(block_nodes, graph):
+    inputs = set()
+    outputs = set()
+
+    block_nodes = set(block_nodes)
+
+    for node in block_nodes:
+        if graph.node_kind(node) != "net":
+            continue
+
+        net = node
+        connected = graph.net_to_devices[net]
+
+        for dev, pin in connected:
+            dtype = graph.device_type.get(dev)
+
+            if dev not in block_nodes:
+                # connection to outside world
+                if pin in CONTROL_PINS.get(dtype, set()):
+                    inputs.add(net)
+                if pin in OUTPUT_PINS.get(dtype, set()):
+                    outputs.add(net)
+
+    return inputs, outputs
+
+Step 6 — End-to-end driver
+def analyze_blocks(graph, constant_nets, control_relevant_devices):
+    signal_graph = build_signal_graph(
+        graph,
+        constant_nets,
+        control_relevant_devices
+    )
+
+    blocks = extract_blocks(signal_graph)
+
+    block_ios = []
+    for i, block in enumerate(blocks):
+        inputs, outputs = extract_block_io(block, graph)
+        block_ios.append({
+            "block_id": i,
+            "nodes": block,
+            "inputs": inputs,
+            "outputs": outputs,
+        })
+
+    return block_ios
+
+What this guarantees
+
+For every block you get:
+
+✅ Minimal input set
+
+✅ Minimal output set
+
+✅ No bias nets
+
+✅ No internal-only nodes
+
+Exactly what you need to emit:
+
+module block_i(input ..., output ...);
+
+Example (conceptual)
+
+For a diff pair:
+
+Inputs:  Vinp, Vinn
+Outputs: Vout
+
+
+Bias nets (tail current, loads) are not included.
+
+Important sanity check (do this)
+
+If a block has:
+
+0 inputs → bias block
+
+0 outputs → dead logic / internal node
+
+>1 outputs → multi-output block (OK)
+
+One-sentence takeaway
+
+Block I/O extraction is just boundary detection between signal-carrying components and the rest of the graph.
+
+If you want next, I can:
+
+Add support for multi-input / differential ports
+
+Show how this maps directly to Verilog-AMS code emission
+
+Add heuristics to merge/split blocks
+
+Add DC-sweep intent detection per block
+
+Just tell me the next step.

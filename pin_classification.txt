@@ -1,0 +1,10 @@
+CONTROL_PINS = {
+    "MOSFET": {"G"},
+    "BJT": {"B"},
+}
+
+OUTPUT_PINS = {
+    "MOSFET": {"D", "S"},
+    "BJT": {"C", "E"},
+}
+

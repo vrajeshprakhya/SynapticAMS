@@ -1,0 +1,37 @@
+* BJT DC Sweep Example (inspired by Masala-CHAI spice1000.txt)
+* Common emitter amplifier with DC sweep on base voltage
+
+* Circuit (based on masala-chai-dataset-new/spice/spice1000.txt)
+VCC 4 0 DC 5V
+R1 4 2 30k
+RC 4 3 2k
+R2 2 0 10k
+RE 1 0 100
+Q1 3 2 1 NPN_MODEL
+
+* Input voltage source for sweep
+VIN 2 0 DC 0V
+
+* NPN BJT model
+.MODEL NPN_MODEL NPN (BF=100 VAF=100 IS=1e-16)
+
+* DC Sweep: Vary base voltage from 0V to 2V
+.DC VIN 0 2 0.02
+
+* Save variables
+.save all
+
+* Control block
+.control
+run
+echo "BJT DC Sweep Complete!"
+echo ""
+echo "Base Voltage (V) | Collector Current (A) | VCE (V)"
+echo "======================================================="
+print v(2) -i(VCC) v(3,1)
+echo ""
+echo "To plot I-V curve: plot -i(VCC) vs v(2)"
+echo "To plot VCE: plot v(3,1) vs v(2)"
+.endc
+
+.end
