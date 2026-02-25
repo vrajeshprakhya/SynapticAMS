@@ -134,8 +134,10 @@ class NgspiceRunner:
         step = sweep_params['step']
         observe = sweep_params['observe']
 
-        # Build observe list (include sweep variable)
-        observe_list = [sweep_var] + [v for v in observe if v != sweep_var]
+        # Only print the observe variables — ngspice always outputs v-sweep as the
+        # x-axis column regardless, so printing the sweep source name (e.g. "Vin")
+        # causes a "vector not available" warning and breaks the output.
+        observe_list = [v for v in observe if v != sweep_var]
 
         # Build options line
         options_line = ""
@@ -285,23 +287,16 @@ quit
                 # Try to parse as tab or space-separated numbers
                 tokens = line.split()
 
-                if len(tokens) < 3:  # Need at least: index, sweep, one observe
+                if len(tokens) < 3:  # Need at least: index, v-sweep, one observe
                     continue
 
                 try:
-                    # Skip first token (index), get remaining numbers
+                    # Skip first token (index), get remaining numbers.
+                    # ngspice always outputs v-sweep as the first column; we no
+                    # longer print the sweep source name, so there is no duplicate.
                     values = [float(t) for t in tokens[1:]]
-
-                    # ngspice outputs: v-sweep, actual_var_name, observe_vars...
-                    # v-sweep and actual_var_name are same, so skip first duplicate
-                    if len(values) >= 2 and abs(values[0] - values[1]) < 1e-12:
-                        # Detected duplicate, skip v-sweep column
-                        sweep_val = values[1]
-                        observe_vals = values[2:]
-                    else:
-                        # No duplicate (shouldn't happen but handle it)
-                        sweep_val = values[0]
-                        observe_vals = values[1:]
+                    sweep_val = values[0]
+                    observe_vals = values[1:]
 
                     results[sweep_var].append(sweep_val)
 
@@ -349,28 +344,16 @@ quit
             try:
                 values = [float(m) for m in matches]
 
-                # Skip first value (index)
-                # Find first unique value (skip duplicates of sweep var)
-                data_values = values[1:]
-
-                # Remove consecutive duplicates (v-sweep and actual sweep var)
-                unique_values = []
-                prev_val = None
-                for val in data_values:
-                    if prev_val is None or abs(val - prev_val) > 1e-12:
-                        unique_values.append(val)
-                    prev_val = val
-
-                if len(unique_values) < 1 + len(observe_vars):
+                # The integer row index (0, 1, 2, ...) doesn't match the
+                # scientific-notation regex, so `values` already contains only
+                # [v-sweep, obs1, obs2, ...].  No column to skip.
+                if len(values) < 1 + len(observe_vars):
                     continue
 
-                # First unique value is sweep variable
-                results[sweep_var].append(unique_values[0])
+                results[sweep_var].append(values[0])
 
-                # Remaining are observe variables
                 for i, obs_var in enumerate(observe_vars):
-                    if i + 1 < len(unique_values):
-                        results[obs_var].append(unique_values[i + 1])
+                    results[obs_var].append(values[i + 1])
 
             except (ValueError, IndexError):
                 continue

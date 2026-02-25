@@ -1,4 +1,8 @@
 __pycache__/
+*.pyc
 *.log
 *.bckup
 .claude/
+.venv/
+*.va
+examples/output/
