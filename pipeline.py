@@ -24,45 +24,180 @@ MAX_ITERATIONS  = 3
 NRMSE_THRESHOLD = 0.05
 
 
-# ── Netlist parsing ────────────────────────────────────────────────────
+# ── SPICE number / voltage parsing ─────────────────────────────────────
+
+# Scale suffixes from the SPICE 3F5 spec (case-insensitive).
+# Note: 'M' = milli (1e-3), NOT mega — use 'meg' for 1e6.
+_SPICE_SCALE = {
+    "meg": 1e6, "mil": 25.4e-6,
+    "t": 1e12, "g": 1e9,  "k": 1e3,
+    "m": 1e-3, "u": 1e-6, "n": 1e-9, "p": 1e-12, "f": 1e-15,
+}
+
+# SPICE 3F5 sec2: fields are separated by blanks, commas, '=', or parentheses.
+_FIELD_SEP_RE = re.compile(r"[,=()]")
+
+def _normalize_seps(line):
+    """Replace all SPICE field separators (comma, =, parentheses) with spaces."""
+    return _FIELD_SEP_RE.sub(" ", line)
+
+
+def _parse_spice_number(s):
+    """
+    Parse a SPICE numeric string including optional scale suffix.
+
+    Examples:
+        "5"       → 5.0
+        "1.8"     → 1.8
+        "5k"      → 5000.0
+        "1.5meg"  → 1500000.0
+        "100n"    → 1e-7
+        "3.14e-6" → 3.14e-6
+        "1.8V"    → 1.8   (unit suffix V is not a scale, silently ignored)
+    """
+    s = s.strip().lower()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    m = re.match(r"^([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)(meg|mil|[tgkmunpf])?", s)
+    if m:
+        return float(m.group(1)) * _SPICE_SCALE.get(m.group(2) or "", 1.0)
+    return 0.0
+
+
+# Keywords that may appear as the 4th token of a V-source line but are NOT
+# a bare DC value.
+_VSRC_KEYWORDS = {"AC", "PULSE", "SIN", "EXP", "PWL", "SFFM", "DISTOF1", "DISTOF2"}
+
+def _parse_spice_dc_voltage(line):
+    """
+    Extract the DC voltage from a SPICE independent voltage source line.
+
+    Normalizes field separators first so comma/paren-delimited netlists work.
+
+    Handles all legal V-source forms from the SPICE 3F5 spec:
+        V1 1 0 DC 5            →  5.0    (explicit DC keyword)
+        V1 1 0 DC 5k           →  5000.0 (scale suffix)
+        V1 1 0 DC 1.8V         →  1.8    (unit suffix, ignored)
+        V1 1 0 5               →  5.0    (implicit DC — bare value, no keyword)
+        V1 1 0 1.8             →  1.8
+        V1 1 0 DC 0 AC 1       →  0.0
+        V1 1 0 AC 1            →  0.0    (AC-only source, no DC component)
+        V1 1 0 PULSE(0 5 ...)  →  0.0    (transient-only source)
+        V1 1 0 SIN(0 1 1MEG)   →  0.0
+        V1,1,0,DC,5            →  5.0    (comma-separated)
+    """
+    norm = _normalize_seps(line)
+
+    # Explicit DC keyword: capture number + optional scale suffix
+    m = re.search(
+        r"\bDC\s+([+-]?[\d.]+(?:[eE][+-]?\d+)?(?:meg|mil|[tgkmunpf])?)",
+        norm, re.I,
+    )
+    if m:
+        return _parse_spice_number(m.group(1))
+
+    # Implicit DC: bare value is the 4th token (after name, N+, N-).
+    # After separator normalization, waveform calls like PULSE(0 5...) become
+    # 'PULSE 0 5...', so tokens[3] is just 'PULSE' — no split("(") needed.
+    tokens = norm.split()
+    if len(tokens) >= 4:
+        tok = tokens[3].upper()
+        if tok not in _VSRC_KEYWORDS:
+            return _parse_spice_number(tokens[3])
+
+    return 0.0
+
+
+# ── Netlist parsing ─────────────────────────────────────────────────────
 
 def parse_netlist(text):
     """
-    Extract simulation parameters from a SPICE netlist.
+    Extract simulation parameters from a SPICE netlist (SPICE 3F5 format).
+
+    Handles per spec (sec2, sec3):
+      - Title line     : the absolute first line is always the circuit title and
+                         is never parsed as an element, even if blank or a comment
+      - Continuation   : lines with '+' in column 1 extend the previous line
+      - Whitespace rule: SPICE 3 treats any line with leading whitespace as a
+                         comment (distinct from the SPICE 2 behaviour)
+      - Field seps     : blank, comma, '=', '(' and ')' are all valid delimiters
+      - V sources      : DC keyword optional; scale suffixes (k, meg, u, n, …)
+      - Transistors    : MOSFET (M: D G S B), BJT (Q: C B E), JFET (J: D G S),
+                         MESFET (Z: D G S)
+
+    Not handled (out of scope):
+      - X subcircuit instances (requires full subcircuit resolution)
+      - I current sources as signal inputs
+      - Diodes (D), passive elements (R, C, L) as output nodes
 
     Returns dict with:
         signal_source  — voltage source name to sweep  (e.g. "Vin")
         output_node    — net to observe                (e.g. "vout")
         vdd            — supply voltage in volts
     """
-    voltage_sources = []   # (name, plus_node, voltage)
-    transistors     = []   # {"drain": ..., "gate": ...}
+    # ── Step 1: Join continuation lines ('+' must be in column 1) ──────
+    joined = []
+    for raw in text.splitlines():
+        if raw.startswith("+") and joined:
+            joined[-1] = joined[-1] + " " + raw[1:].strip()
+        else:
+            joined.append(raw)
 
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith(("*", ".")):
+    # ── Step 2: Parse elements ──────────────────────────────────────────
+    # Per spec: the ABSOLUTE first line of the file is unconditionally the
+    # circuit title — even if it is blank or a comment line.  It is never
+    # parsed as an element.  title_seen is set on the very first iteration
+    # regardless of the line's content.
+    voltage_sources = []   # (name, plus_node, dc_voltage)
+    transistors     = []   # {"drain": ..., "gate": ...}
+    title_seen      = False
+
+    for line in joined:
+        # Title: consume the absolute first line unconditionally.
+        if not title_seen:
+            title_seen = True
             continue
-        tokens = line.split()
-        name  = tokens[0]
-        dtype = name[0].upper()
+
+        stripped = line.strip()
+        if not stripped or stripped.startswith("*"):
+            continue                              # blank or '*' comment
+
+        # SPICE 3 rule: any line whose first character is whitespace is a comment.
+        if line[0] in (" ", "\t"):
+            continue
+
+        if stripped.startswith("."):
+            continue                              # SPICE directive
+
+        # Normalize field separators before tokenizing (sec2: comma, =, ( and )
+        # are all valid delimiters equivalent to a blank).
+        tokens = _normalize_seps(stripped).split()
+        if not tokens:
+            continue
+        dtype = tokens[0][0].upper()
 
         if dtype == "V" and len(tokens) >= 3:
-            m = re.search(r"DC\s+([\d.eE+-]+)", line, re.I)
-            voltage = float(m.group(1)) if m else 0.0
-            voltage_sources.append((name, tokens[1].lower(), voltage))
+            dc_v = _parse_spice_dc_voltage(stripped)
+            voltage_sources.append((tokens[0], tokens[1].lower(), dc_v))
 
-        elif dtype == "M" and len(tokens) >= 5:   # MOSFET: M D G S B model
+        elif dtype in ("M", "J", "Z") and len(tokens) >= 5:
+            # M: Drain Gate Source Bulk  model …
+            # J: Drain Gate Source       model …
+            # Z: Drain Gate Source       model …  (MESFET)
             transistors.append({"drain": tokens[1].lower(),
                                  "gate":  tokens[2].lower()})
 
-        elif dtype == "Q" and len(tokens) >= 4:   # BJT: Q C B E model
-            transistors.append({"drain": tokens[1].lower(),
-                                 "gate":  tokens[2].lower()})
+        elif dtype == "Q" and len(tokens) >= 4:
+            # Q: Collector Base Emitter [Substrate] model …
+            transistors.append({"drain": tokens[1].lower(),   # collector
+                                 "gate":  tokens[2].lower()})  # base
 
     if not voltage_sources:
         raise ValueError("No voltage sources found in netlist")
 
-    voltage_sources.sort(key=lambda v: v[2])     # ascending by voltage
+    voltage_sources.sort(key=lambda v: v[2])     # ascending by DC voltage
     signal_src  = voltage_sources[0]             # lowest V  → signal input
     supply_src  = voltage_sources[-1]            # highest V → supply
 
@@ -70,7 +205,7 @@ def parse_netlist(text):
     supply_node   = supply_src[1]               # e.g. "vdd"
     vdd           = supply_src[2] if supply_src[2] > 0.5 else 1.8
 
-    # Output: first transistor drain that isn't ground or the supply rail
+    # Output: first transistor terminal that isn't ground or the supply rail
     output_node = None
     for t in transistors:
         if t["drain"] not in ("0", supply_node):
