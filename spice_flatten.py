@@ -22,6 +22,11 @@ Does NOT support (simulator extensions, not part of SPICE 3F5 base spec):
     - .PARAM / PARAMS: parameterized subcircuits
     - {expression} syntax
     - $ inline comments (ngspice extension)
+
+Known limitations (spec-legal but not implemented):
+    - Nested .SUBCKT definitions (.SUBCKT inside .SUBCKT): the inner subcircuit
+      type is not registered in self.subcircuits and cannot be instantiated via
+      X. Define all subcircuits at the top level (the common practice).
 """
 
 import re
@@ -196,9 +201,11 @@ class SpiceFlattener:
                 depth -= 1
                 if depth == 0:
                     break
-            elif upper.startswith(".GLOBAL"):
-                # .GLOBAL inside a subcircuit body — register the globals so they
-                # are never prefixed when this subcircuit is flattened.
+            elif upper.startswith(".GLOBAL") and depth == 1:
+                # .GLOBAL at this subcircuit's immediate body level — register
+                # so these nets are never prefixed during flattening.
+                # depth > 1 means we are inside a nested .SUBCKT definition;
+                # those globals belong to a tighter scope and are not promoted.
                 for gnode in line.strip().split()[1:]:
                     self.global_nodes.add(gnode.upper())
             if depth > 0:
@@ -271,26 +278,37 @@ class SpiceFlattener:
         self.included_files.add(abs_filename)
         try:
             with open(abs_filename) as f:
-                lines = f.readlines()
+                raw_lines = f.readlines()
         except FileNotFoundError:
             print(f"Warning: library not found: {abs_filename}", file=sys.stderr)
             return
+        # Process continuation lines first so that all scanning (including
+        # .LIB section headers and .SUBCKT headers) uses joined logical lines.
+        # This also ensures _parse_subcircuit receives the same array and its
+        # returned end_idx correctly corresponds to positions in `lines`.
+        lines = self._process_line_continuation(raw_lines)
         in_section = False
         section_upper = section.upper()
         i = 0
         while i < len(lines):
             line = lines[i].rstrip()
             upper = line.upper().strip()
-            if upper.startswith(".LIB") and section_upper in upper:
-                in_section = True
-                i += 1
-                continue
+            # .LIB <section> starts the section — compare section name as an
+            # exact token (not a substring) to avoid false matches when the
+            # section name appears inside a filename token.
+            if upper.startswith(".LIB"):
+                tokens = upper.split()
+                if section_upper in tokens[1:]:
+                    in_section = True
+                    i += 1
+                    continue
             if upper.startswith(".ENDL") and in_section:
                 break
             if in_section:
                 if upper.startswith(".SUBCKT"):
-                    cont_lines = self._process_line_continuation(lines)
-                    subckt, end_idx = self._parse_subcircuit(cont_lines, i)
+                    # `lines` is already continuation-processed; end_idx maps
+                    # directly back to positions in this same array.
+                    subckt, end_idx = self._parse_subcircuit(lines, i)
                     self.subcircuits[subckt.name.upper()] = subckt
                     i = end_idx + 1
                     continue

@@ -115,6 +115,10 @@ def _parse_spice_dc_voltage(line):
     return 0.0
 
 
+# Ground node names: SPICE 3F5 specifies only "0"; "gnd" is a common
+# simulator extension (ngspice, HSPICE) treated as synonymous here.
+_GROUND_NODES = {"0", "gnd"}
+
 # ── Netlist parsing ─────────────────────────────────────────────────────
 
 def parse_netlist(text):
@@ -159,6 +163,11 @@ def parse_netlist(text):
       - Dual/negative supply without .DC : e.g. VEE=-5 DC sorts below Vin=0 and
                                  is chosen as signal_source (wrong). Adding a
                                  .DC directive to the netlist fixes this.
+      - Multiple .DC directives  : only the first is used; the second sweep
+                                 variable (nested .DC sweep) is ignored.
+      - "gnd" as ground synonym  : SPICE 3F5 specifies only node "0" as ground;
+                                 "gnd" is accepted here as a common extension
+                                 (ngspice/HSPICE) but other synonyms are not.
       - .PARAM / {expr} / PARAMS: : simulator-specific extensions, not SPICE 3F5.
       - $ inline comments          : ngspice extension, not SPICE 3F5.
 
@@ -219,9 +228,12 @@ def parse_netlist(text):
             elif upper.startswith(".DC") and subckt_depth == 0:
                 # .DC source start stop step [src2 start2 stop2 step2]
                 # The first source is the inner (signal) sweep variable.
-                dc_tokens = _normalize_seps(stripped).split()
-                if len(dc_tokens) >= 2:
-                    dc_sweep_source = dc_tokens[1]
+                # Only the first .DC directive is used; subsequent ones are
+                # ignored (multiple .DC = nested sweep, which is out of scope).
+                if dc_sweep_source is None:
+                    dc_tokens = _normalize_seps(stripped).split()
+                    if len(dc_tokens) >= 2:
+                        dc_sweep_source = dc_tokens[1]
 
             elif upper.startswith(".END") and not upper.startswith(".ENDS"):
                 # Per spec sec2: .END marks the absolute end of the netlist.
@@ -272,7 +284,7 @@ def parse_netlist(text):
     supply_src  = voltage_sources[-1]            # highest V → supply
 
     supply_node = supply_src[1]                  # e.g. "vdd"
-    vdd         = supply_src[2] if supply_src[2] > 0.5 else 1.8
+    vdd         = supply_src[2] if supply_src[2] > 0 else 1.8
 
     # ── Signal source: .DC directive beats the heuristic ────────────────
     signal_source = None
@@ -292,7 +304,7 @@ def parse_netlist(text):
     # ── Output node: first device terminal not on ground or supply ───────
     output_node = None
     for t in transistors:
-        if t["drain"] not in ("0", supply_node):
+        if t["drain"] not in _GROUND_NODES and t["drain"] != supply_node:
             output_node = t["drain"]
             break
     if output_node is None and transistors:
@@ -301,7 +313,7 @@ def parse_netlist(text):
     # If no transistors found, try diode anodes as a last resort.
     if output_node is None:
         for d in diodes:
-            if d["anode"] not in ("0", supply_node):
+            if d["anode"] not in _GROUND_NODES and d["anode"] != supply_node:
                 output_node = d["anode"]
                 break
 
