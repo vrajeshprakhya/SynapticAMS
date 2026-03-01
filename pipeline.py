@@ -148,7 +148,19 @@ def parse_netlist(text):
       - .DC source start stop step  : sets signal_source directly (more reliable
                                       than the lowest-voltage heuristic)
       - .SUBCKT / .ENDS             : depth tracking
+      - .END                        : stops parsing (spec: all content after .END
+                                      is outside the netlist and must be ignored)
       - All other directives (.MODEL, .AC, .TRAN, .OP, .OPTIONS, …) skipped
+
+    Known limitations (out of scope):
+      - I-source signal inputs : .DC Isrc 0 1u 10n has no matching V source,
+                                 so signal_source falls back to the lowest-DC-V
+                                 heuristic, which may pick a supply rail instead.
+      - Dual/negative supply without .DC : e.g. VEE=-5 DC sorts below Vin=0 and
+                                 is chosen as signal_source (wrong). Adding a
+                                 .DC directive to the netlist fixes this.
+      - .PARAM / {expr} / PARAMS: : simulator-specific extensions, not SPICE 3F5.
+      - $ inline comments          : ngspice extension, not SPICE 3F5.
 
     Returns dict with:
         signal_source  — voltage source name to sweep  (e.g. "Vin")
@@ -210,6 +222,12 @@ def parse_netlist(text):
                 dc_tokens = _normalize_seps(stripped).split()
                 if len(dc_tokens) >= 2:
                     dc_sweep_source = dc_tokens[1]
+
+            elif upper == ".END":
+                # Per spec sec2: .END marks the absolute end of the netlist.
+                # Anything after this line is outside the circuit description
+                # and must be ignored.
+                break
 
             continue   # never parse a directive line as an element
 

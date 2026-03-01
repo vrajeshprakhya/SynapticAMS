@@ -12,6 +12,7 @@ Public API:
 
 Supports (SPICE 3F5 spec):
     - .SUBCKT / .ENDS (including nested subcircuits)
+    - .GLOBAL node declarations (global nets bypass hierarchy and are never renamed)
     - Line continuation ('+' in column 1)
     - .INCLUDE / .LIB file includes (when base_dir is provided)
     - All comment forms: '*' in column 1, leading whitespace (SPICE 3 rule)
@@ -50,6 +51,11 @@ class SpiceFlattener:
         self.top_level_lines: list[str] = []
         self.included_files: set[str] = set()
         self.base_dir: str = "."
+        # Node names that are never prefixed during flattening.
+        # Pre-populated with universally-standard power/ground names;
+        # extended at parse time by any .GLOBAL declarations in the netlist.
+        # Stored uppercase because SPICE node names are case-insensitive.
+        self.global_nodes: set[str] = {"GND", "VDD", "VSS", "VDDA", "VSSA", "0"}
 
     # ── Public entry points ─────────────────────────────────────────────
 
@@ -149,6 +155,16 @@ class SpiceFlattener:
                 if lib_file:
                     ref = source_file or os.path.join(self.base_dir, "_")
                     self._process_lib(lib_file, section, ref)
+                if is_top_level:
+                    self.top_level_lines.append(line)
+                i += 1
+
+            elif upper.startswith(".GLOBAL"):
+                # .GLOBAL node1 node2 ...
+                # These nets are accessible everywhere without being in any
+                # subcircuit's port list — they must never be prefixed.
+                for gnode in line.strip().split()[1:]:
+                    self.global_nodes.add(gnode.upper())
                 if is_top_level:
                     self.top_level_lines.append(line)
                 i += 1
@@ -386,7 +402,7 @@ class SpiceFlattener:
                      prefix: str) -> str:
         if node in port_map:
             return port_map[node]
-        if node.upper() in {"GND", "VDD", "VSS", "VDDA", "VSSA", "0"}:
+        if node.upper() in self.global_nodes:   # standard + .GLOBAL declared nets
             return node
         return f"{prefix}_{node}"
 
