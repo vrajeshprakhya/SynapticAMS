@@ -1,0 +1,25 @@
+* Library with multiple corner sections
+
+.LIB TYPICAL
+.SUBCKT NMOS_TYP D G S B
+* Typical corner NMOS
+.model nmos_typ NMOS (level=1 vto=0.7 kp=120u)
+M1 D G S B nmos_typ W=1u L=0.5u
+.ENDS
+.ENDL
+
+.LIB FAST
+.SUBCKT NMOS_FAST D G S B
+* Fast corner NMOS
+.model nmos_fast NMOS (level=1 vto=0.6 kp=150u)
+M1 D G S B nmos_fast W=1u L=0.5u
+.ENDS
+.ENDL
+
+.LIB SLOW
+.SUBCKT NMOS_SLOW D G S B
+* Slow corner NMOS  
+.model nmos_slow NMOS (level=1 vto=0.8 kp=90u)
+M1 D G S B nmos_slow W=1u L=0.5u
+.ENDS
+.ENDL

@@ -1,0 +1,12 @@
+* Basic gate library
+.SUBCKT INV_TEST IN OUT VDD GND
+M1 OUT IN VDD VDD pmos W=2u L=0.5u
+M2 OUT IN GND GND nmos W=1u L=0.5u
+.ENDS
+
+.SUBCKT NAND2_TEST A B OUT VDD GND
+M1 OUT A VDD VDD pmos W=2u L=0.5u
+M2 OUT B VDD VDD pmos W=2u L=0.5u
+M3 OUT A net1 GND nmos W=2u L=0.5u
+M4 net1 B GND GND nmos W=2u L=0.5u
+.ENDS
