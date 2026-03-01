@@ -289,6 +289,10 @@ class SpiceFlattener:
                     self.subcircuits[subckt.name.upper()] = subckt
                     i = end_idx + 1
                     continue
+                elif upper.startswith(".GLOBAL"):
+                    # .GLOBAL inside a .LIB section — same treatment as top-level.
+                    for gnode in line.strip().split()[1:]:
+                        self.global_nodes.add(gnode.upper())
             i += 1
 
     # ── Flattening ──────────────────────────────────────────────────────
