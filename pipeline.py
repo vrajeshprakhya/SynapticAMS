@@ -20,6 +20,11 @@ from pathlib import Path
 from ngspice_runner import NgspiceRunner, NgspiceError
 from ai_agent import create_agent, generate, refine, compute_nrmse, evaluate_va_code
 
+try:
+    from spice_flatten import flatten_netlist as _flatten_netlist
+except ImportError:
+    _flatten_netlist = None
+
 MAX_ITERATIONS  = 3
 NRMSE_THRESHOLD = 0.05
 
@@ -116,27 +121,47 @@ def parse_netlist(text):
     """
     Extract simulation parameters from a SPICE netlist (SPICE 3F5 format).
 
-    Handles per spec (sec2, sec3):
-      - Title line     : the absolute first line is always the circuit title and
-                         is never parsed as an element, even if blank or a comment
-      - Continuation   : lines with '+' in column 1 extend the previous line
-      - Whitespace rule: SPICE 3 treats any line with leading whitespace as a
-                         comment (distinct from the SPICE 2 behaviour)
-      - Field seps     : blank, comma, '=', '(' and ')' are all valid delimiters
-      - V sources      : DC keyword optional; scale suffixes (k, meg, u, n, …)
-      - Transistors    : MOSFET (M: D G S B), BJT (Q: C B E), JFET (J: D G S),
-                         MESFET (Z: D G S)
+    Handles per spec:
 
-    Not handled (out of scope):
-      - X subcircuit instances (requires full subcircuit resolution)
-      - I current sources as signal inputs
-      - Diodes (D), passive elements (R, C, L) as output nodes
+    Sec 2 — Syntax:
+      - Title line     : absolute first line is unconditionally the title
+      - Continuation   : '+' in column 1 extends the previous line
+      - Comments       : '*' in column 1 OR any leading whitespace (SPICE 3)
+      - Field seps     : blank, comma, '=', '(' and ')' are equivalent
+
+    Sec 3 — Elements parsed:
+      - V sources      : DC keyword optional; all scale suffixes (k/meg/u/n/…)
+      - MOSFET (M)     : D G S B model …
+      - BJT   (Q)      : C B E [S] model …
+      - JFET  (J)      : D G S model …
+      - MESFET(Z)      : D G S model …
+      - Diode (D)      : N+ N- model …  (N+ used as output candidate)
+      - All other elements (R/C/L/I/G/E/F/H/B/S/W/T/O/U/K) silently ignored
+
+    Sec 3 — Subcircuits:
+      - If spice_flatten is available, hierarchical netlists with .SUBCKT /
+        X instances are pre-flattened before parsing.
+      - .SUBCKT depth is tracked regardless so that elements inside subcircuit
+        definitions are never treated as top-level elements.
+
+    Sec 4 — Directives parsed:
+      - .DC source start stop step  : sets signal_source directly (more reliable
+                                      than the lowest-voltage heuristic)
+      - .SUBCKT / .ENDS             : depth tracking
+      - All other directives (.MODEL, .AC, .TRAN, .OP, .OPTIONS, …) skipped
 
     Returns dict with:
         signal_source  — voltage source name to sweep  (e.g. "Vin")
         output_node    — net to observe                (e.g. "vout")
         vdd            — supply voltage in volts
     """
+    # ── Step 0: Flatten subcircuits if spice_flatten is available ───────
+    # Detects any .SUBCKT definition in the text and flattens before parsing,
+    # so X instances become visible as regular M/Q/J/Z/D/V elements.
+    if _flatten_netlist is not None and re.search(
+            r"^\s*\.subckt\b", text, re.I | re.M):
+        text = _flatten_netlist(text)
+
     # ── Step 1: Join continuation lines ('+' must be in column 1) ──────
     joined = []
     for raw in text.splitlines():
@@ -145,14 +170,15 @@ def parse_netlist(text):
         else:
             joined.append(raw)
 
-    # ── Step 2: Parse elements ──────────────────────────────────────────
-    # Per spec: the ABSOLUTE first line of the file is unconditionally the
-    # circuit title — even if it is blank or a comment line.  It is never
-    # parsed as an element.  title_seen is set on the very first iteration
-    # regardless of the line's content.
-    voltage_sources = []   # (name, plus_node, dc_voltage)
-    transistors     = []   # {"drain": ..., "gate": ...}
-    title_seen      = False
+    # ── Step 2: Parse elements and relevant directives ──────────────────
+    # Per spec: the ABSOLUTE first line is unconditionally the circuit title —
+    # even if blank or a comment — and is never parsed as an element.
+    voltage_sources  = []   # (name, plus_node, dc_voltage)
+    transistors      = []   # {"drain": ..., "gate": ...}
+    diodes           = []   # {"anode": ..., "cathode": ...}
+    dc_sweep_source  = None # source name from .DC directive, if present
+    subckt_depth     = 0    # >0 means we are inside a .SUBCKT block
+    title_seen       = False
 
     for line in joined:
         # Title: consume the absolute first line unconditionally.
@@ -168,8 +194,29 @@ def parse_netlist(text):
         if line[0] in (" ", "\t"):
             continue
 
+        # ── Directive handling ──────────────────────────────────────────
         if stripped.startswith("."):
-            continue                              # SPICE directive
+            upper = stripped.upper()
+
+            if upper.startswith(".SUBCKT"):
+                subckt_depth += 1
+
+            elif upper.startswith(".ENDS"):
+                subckt_depth = max(0, subckt_depth - 1)
+
+            elif upper.startswith(".DC") and subckt_depth == 0:
+                # .DC source start stop step [src2 start2 stop2 step2]
+                # The first source is the inner (signal) sweep variable.
+                dc_tokens = _normalize_seps(stripped).split()
+                if len(dc_tokens) >= 2:
+                    dc_sweep_source = dc_tokens[1]
+
+            continue   # never parse a directive line as an element
+
+        # Skip element lines that are inside a .SUBCKT definition.
+        # (Normally resolved by the pre-flattener; this is a safety net.)
+        if subckt_depth > 0:
+            continue
 
         # Normalize field separators before tokenizing (sec2: comma, =, ( and )
         # are all valid delimiters equivalent to a blank).
@@ -194,25 +241,51 @@ def parse_netlist(text):
             transistors.append({"drain": tokens[1].lower(),   # collector
                                  "gate":  tokens[2].lower()})  # base
 
+        elif dtype == "D" and len(tokens) >= 3:
+            # D: N+ (anode) N- (cathode) model …
+            # N+ is stored as a fallback output-node candidate.
+            diodes.append({"anode":   tokens[1].lower(),
+                           "cathode": tokens[2].lower()})
+
     if not voltage_sources:
         raise ValueError("No voltage sources found in netlist")
 
     voltage_sources.sort(key=lambda v: v[2])     # ascending by DC voltage
-    signal_src  = voltage_sources[0]             # lowest V  → signal input
     supply_src  = voltage_sources[-1]            # highest V → supply
 
-    signal_source = signal_src[0]               # e.g. "Vin"
-    supply_node   = supply_src[1]               # e.g. "vdd"
-    vdd           = supply_src[2] if supply_src[2] > 0.5 else 1.8
+    supply_node = supply_src[1]                  # e.g. "vdd"
+    vdd         = supply_src[2] if supply_src[2] > 0.5 else 1.8
 
-    # Output: first transistor terminal that isn't ground or the supply rail
+    # ── Signal source: .DC directive beats the heuristic ────────────────
+    signal_source = None
+    if dc_sweep_source:
+        # Case-insensitive match against the V sources we found.
+        for vs in voltage_sources:
+            if vs[0].upper() == dc_sweep_source.upper():
+                signal_source = vs[0]
+                break
+        if signal_source is None:
+            # .DC names a source not present as a V element (e.g. a current
+            # source or a source inside a subcircuit) — fall back to heuristic.
+            signal_source = voltage_sources[0][0]
+    else:
+        signal_source = voltage_sources[0][0]    # lowest DC voltage = signal
+
+    # ── Output node: first device terminal not on ground or supply ───────
     output_node = None
     for t in transistors:
         if t["drain"] not in ("0", supply_node):
             output_node = t["drain"]
             break
     if output_node is None and transistors:
-        output_node = transistors[0]["drain"]   # fallback
+        output_node = transistors[0]["drain"]    # fallback to first transistor
+
+    # If no transistors found, try diode anodes as a last resort.
+    if output_node is None:
+        for d in diodes:
+            if d["anode"] not in ("0", supply_node):
+                output_node = d["anode"]
+                break
 
     return {
         "signal_source": signal_source,
