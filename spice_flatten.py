@@ -504,6 +504,11 @@ def flatten_netlist(text: str, base_dir: str = ".") -> str:
     Resolves all .SUBCKT definitions and X subcircuit instances inline.
     .INCLUDE / .LIB references are resolved relative to base_dir if provided.
 
+    Per SPICE 3F5 sec2, the absolute first line of a netlist is unconditionally
+    the title and is never parsed as an element.  This function preserves it
+    verbatim so that titles starting with 'X' are not mistaken for subcircuit
+    instances.
+
     Args:
         text:     SPICE netlist as a string
         base_dir: directory used to resolve .INCLUDE / .LIB paths
@@ -511,9 +516,15 @@ def flatten_netlist(text: str, base_dir: str = ".") -> str:
     Returns:
         Flat netlist string (all X instances replaced with their contents).
     """
+    lines = text.splitlines()
+    if not lines:
+        return text
+    # Separate the title from the circuit body before flattening.
+    title = lines[0]
+    body  = "\n".join(lines[1:])
     f = SpiceFlattener()
-    f.parse_text(text, base_dir=base_dir)
-    return f.flatten_text()
+    f.parse_text(body, base_dir=base_dir)
+    return title + "\n" + f.flatten_text()
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────

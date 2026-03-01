@@ -65,7 +65,10 @@ def _parse_spice_number(s):
         return float(s)
     except ValueError:
         pass
-    m = re.match(r"^([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)(meg|mil|[tgkmunpf])?", s)
+    # Per SPICE 3F5 sec2, the numeric form is [DIGIT]+[.DIGIT*] — digits after
+    # the decimal are optional, so "5." (no trailing digit) is valid.
+    # The alternation covers both forms: "5" / "5." / "5.0" and ".5" / "0.5".
+    m = re.match(r"^([+-]?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][+-]?\d+)?)(meg|mil|[tgkmunpf])?", s)
     if m:
         return float(m.group(1)) * _SPICE_SCALE.get(m.group(2) or "", 1.0)
     return 0.0
@@ -165,6 +168,11 @@ def parse_netlist(text):
                                  .DC directive to the netlist fixes this.
       - Multiple .DC directives  : only the first is used; the second sweep
                                  variable (nested .DC sweep) is ignored.
+      - .DC source inside a subcircuit : if the signal V source is defined
+                                 inside a .SUBCKT, the flattener renames it
+                                 (e.g. Vin → V_X1_in) but the .DC directive is
+                                 not updated to match. Standard practice is to
+                                 define the signal source at the top level.
       - "gnd" as ground synonym  : SPICE 3F5 specifies only node "0" as ground;
                                  "gnd" is accepted here as a common extension
                                  (ngspice/HSPICE) but other synonyms are not.
