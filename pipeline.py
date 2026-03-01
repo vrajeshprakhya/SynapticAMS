@@ -223,7 +223,7 @@ def parse_netlist(text):
                 if len(dc_tokens) >= 2:
                     dc_sweep_source = dc_tokens[1]
 
-            elif upper == ".END":
+            elif upper.startswith(".END") and not upper.startswith(".ENDS"):
                 # Per spec sec2: .END marks the absolute end of the netlist.
                 # Anything after this line is outside the circuit description
                 # and must be ignored.

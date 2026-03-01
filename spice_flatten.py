@@ -196,6 +196,11 @@ class SpiceFlattener:
                 depth -= 1
                 if depth == 0:
                     break
+            elif upper.startswith(".GLOBAL"):
+                # .GLOBAL inside a subcircuit body — register the globals so they
+                # are never prefixed when this subcircuit is flattened.
+                for gnode in line.strip().split()[1:]:
+                    self.global_nodes.add(gnode.upper())
             if depth > 0:
                 body_lines.append(line)
             i += 1
@@ -331,7 +336,8 @@ class SpiceFlattener:
                     f"({len(connected_nodes)} given, "
                     f"{len(subckt.ports)} expected)"]
 
-        port_map = dict(zip(subckt.ports, connected_nodes))
+        # Store ports lowercase — SPICE node names are matched case-insensitively.
+        port_map = {p.lower(): n for p, n in zip(subckt.ports, connected_nodes)}
         unique_prefix = f"{prefix}_{instance_name}" if prefix else instance_name
 
         result = [
@@ -404,8 +410,10 @@ class SpiceFlattener:
 
     def _rename_node(self, node: str, port_map: dict[str, str],
                      prefix: str) -> str:
-        if node in port_map:
-            return port_map[node]
+        # port_map keys are lowercase; compare case-insensitively.
+        mapped = port_map.get(node.lower())
+        if mapped is not None:
+            return mapped
         if node.upper() in self.global_nodes:   # standard + .GLOBAL declared nets
             return node
         return f"{prefix}_{node}"
