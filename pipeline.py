@@ -66,9 +66,9 @@ def _parse_spice_number(s):
     return 0.0
 
 
-# Keywords that may appear as the 4th token of a V-source line but are NOT
-# a bare DC value.
-_VSRC_KEYWORDS = {"AC", "PULSE", "SIN", "EXP", "PWL", "SFFM", "DISTOF1", "DISTOF2"}
+# Keywords that may appear as the 4th token of a V-source or I-source line but
+# are NOT a bare DC value.
+_SRC_KEYWORDS = {"AC", "PULSE", "SIN", "EXP", "PWL", "SFFM", "DISTOF1", "DISTOF2"}
 
 def _parse_spice_dc_voltage(line):
     """
@@ -104,10 +104,24 @@ def _parse_spice_dc_voltage(line):
     tokens = norm.split()
     if len(tokens) >= 4:
         tok = tokens[3].upper()
-        if tok not in _VSRC_KEYWORDS:
+        if tok not in _SRC_KEYWORDS:
             return _parse_spice_number(tokens[3])
 
     return 0.0
+
+
+def _parse_spice_dc_current(line):
+    """
+    Extract the DC current from a SPICE independent current source line.
+
+    Uses the same parsing logic as voltage sources - both follow the same syntax:
+        I1 1 0 DC 1u           →  1e-6    (explicit DC keyword)
+        I1 1 0 1u              →  1e-6    (implicit DC — bare value)
+        I1 1 0 DC 0 AC 1m      →  0.0
+        I1 1 0 PULSE(0 1u ...) →  0.0     (transient-only source)
+    """
+    # Current sources use identical syntax to voltage sources
+    return _parse_spice_dc_voltage(line)
 
 
 # ── Netlist parsing ─────────────────────────────────────────────────────
@@ -129,12 +143,11 @@ def parse_netlist(text):
 
     Not handled (out of scope):
       - X subcircuit instances (requires full subcircuit resolution)
-      - I current sources as signal inputs
       - Diodes (D), passive elements (R, C, L) as output nodes
 
     Returns dict with:
-        signal_source  — voltage source name to sweep  (e.g. "Vin")
-        output_node    — net to observe                (e.g. "vout")
+        signal_source  — voltage or current source to sweep (e.g. "Vin", "Isrc")
+        output_node    — net to observe                    (e.g. "vout")
         vdd            — supply voltage in volts
     """
     # ── Step 1: Join continuation lines ('+' must be in column 1) ──────
@@ -151,6 +164,7 @@ def parse_netlist(text):
     # parsed as an element.  title_seen is set on the very first iteration
     # regardless of the line's content.
     voltage_sources = []   # (name, plus_node, dc_voltage)
+    current_sources = []   # (name, plus_node, dc_current)
     transistors     = []   # {"drain": ..., "gate": ...}
     title_seen      = False
 
@@ -182,6 +196,10 @@ def parse_netlist(text):
             dc_v = _parse_spice_dc_voltage(stripped)
             voltage_sources.append((tokens[0], tokens[1].lower(), dc_v))
 
+        elif dtype == "I" and len(tokens) >= 3:
+            dc_i = _parse_spice_dc_current(stripped)
+            current_sources.append((tokens[0], tokens[1].lower(), dc_i))
+
         elif dtype in ("M", "J", "Z") and len(tokens) >= 5:
             # M: Drain Gate Source Bulk  model …
             # J: Drain Gate Source       model …
@@ -194,16 +212,38 @@ def parse_netlist(text):
             transistors.append({"drain": tokens[1].lower(),   # collector
                                  "gate":  tokens[2].lower()})  # base
 
-    if not voltage_sources:
-        raise ValueError("No voltage sources found in netlist")
+    # ── Step 3: Identify signal source and supply ───────────────────────
+    # Heuristic:
+    #   1. If current sources exist, prefer the one with lowest DC (typically 0)
+    #      as the signal input (current-mode circuits)
+    #   2. Otherwise, use voltage source with lowest DC as signal input
+    #   3. Supply voltage always comes from highest voltage source
 
-    voltage_sources.sort(key=lambda v: v[2])     # ascending by DC voltage
-    signal_src  = voltage_sources[0]             # lowest V  → signal input
-    supply_src  = voltage_sources[-1]            # highest V → supply
+    if not voltage_sources and not current_sources:
+        raise ValueError("No voltage or current sources found in netlist")
 
-    signal_source = signal_src[0]               # e.g. "Vin"
-    supply_node   = supply_src[1]               # e.g. "vdd"
-    vdd           = supply_src[2] if supply_src[2] > 0.5 else 1.8
+    # Determine signal source (prefer current sources if they exist)
+    if current_sources:
+        current_sources.sort(key=lambda i: abs(i[2]))  # sort by absolute DC current
+        signal_src = current_sources[0]                # lowest |I| → signal input
+        signal_source = signal_src[0]                  # e.g. "Isrc"
+    elif voltage_sources:
+        voltage_sources.sort(key=lambda v: v[2])       # sort by DC voltage
+        signal_src = voltage_sources[0]                # lowest V → signal input
+        signal_source = signal_src[0]                  # e.g. "Vin"
+    else:
+        raise ValueError("No sources found in netlist")
+
+    # Supply voltage: always use highest voltage source (if any)
+    if voltage_sources:
+        voltage_sources.sort(key=lambda v: v[2])       # ensure sorted
+        supply_src  = voltage_sources[-1]              # highest V → supply
+        supply_node = supply_src[1]                    # e.g. "vdd"
+        vdd         = supply_src[2] if supply_src[2] > 0.5 else 1.8
+    else:
+        # No voltage sources - unusual case (current-only circuit)
+        supply_node = "vdd"
+        vdd         = 1.8  # default assumption
 
     # Output: first transistor terminal that isn't ground or the supply rail
     output_node = None
