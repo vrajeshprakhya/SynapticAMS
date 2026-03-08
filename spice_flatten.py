@@ -12,21 +12,31 @@ Public API:
 
 Supports (SPICE 3F5 spec):
     - .SUBCKT / .ENDS (including nested subcircuits)
+    - .END terminates the netlist (everything after is ignored)
+    - .MODEL declarations: model names are tracked so they are never
+      mistakenly renamed as net names during flattening
     - .GLOBAL node declarations (global nets bypass hierarchy and are never renamed)
     - Line continuation ('+' in column 1)
     - .INCLUDE / .LIB file includes (when base_dir is provided)
     - All comment forms: '*' in column 1, leading whitespace (SPICE 3 rule)
-    - All device types: M, Q, J, Z, D, R, C, L, V, I, G, E, F, H, K, B, S, W
+    - All device types: M, Q (3- or 4-terminal), J, Z, D, R, C, L, V, I,
+      G, E, F, H, K, B, S, W
+    - Q BJT: optional substrate node (4th terminal) correctly renamed
+    - K mutual inductor: L1/L2 references renamed as device names (not nets)
+    - F/H controlled sources: Vnam controlling-source reference renamed correctly
+    - PARAMS: keyword arguments on X instance lines: stripped so port
+      matching works; parameter values are discarded
 
 Does NOT support (simulator extensions, not part of SPICE 3F5 base spec):
-    - .PARAM / PARAMS: parameterized subcircuits
-    - {expression} syntax
-    - $ inline comments (ngspice extension)
+    - .PARAM / {expression} syntax (parameterized values)
 
-Known limitations (spec-legal but not implemented):
-    - Nested .SUBCKT definitions (.SUBCKT inside .SUBCKT): the inner subcircuit
-      type is not registered in self.subcircuits and cannot be instantiated via
-      X. Define all subcircuits at the top level (the common practice).
+Partially supported (simulator extensions implemented because they are
+ubiquitous in real netlists):
+    - $ inline comments (ngspice/HSPICE extension): everything from the
+      first unquoted '$' to end-of-line is treated as a comment.
+    - Nested .SUBCKT definitions: inner subcircuits are now registered and
+      can be instantiated.  The common restriction (define at top level)
+      no longer applies.
 """
 
 import re
@@ -61,6 +71,9 @@ class SpiceFlattener:
         # extended at parse time by any .GLOBAL declarations in the netlist.
         # Stored uppercase because SPICE node names are case-insensitive.
         self.global_nodes: set[str] = {"GND", "VDD", "VSS", "VDDA", "VSSA", "0"}
+        # Model names declared with .MODEL; used to prevent renaming model
+        # references as if they were circuit net names during flattening.
+        self.model_names: set[str] = set()
 
     # ── Public entry points ─────────────────────────────────────────────
 
@@ -105,20 +118,46 @@ class SpiceFlattener:
 
     # ── Internal parsing ────────────────────────────────────────────────
 
+    @staticmethod
+    def _strip_inline_comment(line: str) -> str:
+        """
+        Strip ngspice/HSPICE $ inline comments.
+
+        Per the ngspice manual, '$' starts a comment unless it is inside a
+        quoted string.  SPICE 3F5 does not define this character, but it
+        appears in virtually every real-world foundry PDK file.
+
+        Only the unquoted first '$' is recognised; nested/escaped '$' are
+        not part of any standard and are ignored.
+        """
+        in_quote = False
+        quote_char = None
+        for idx, ch in enumerate(line):
+            if ch in ('"', "'") and not in_quote:
+                in_quote = True
+                quote_char = ch
+            elif in_quote and ch == quote_char:
+                in_quote = False
+                quote_char = None
+            elif ch == '$' and not in_quote:
+                return line[:idx].rstrip()
+        return line
+
     def _process_line_continuation(self, raw_lines: list[str]) -> list[str]:
         """
         Join continuation lines ('+' in column 1 per SPICE 3F5 sec2).
         Reads from column 2 onwards on continuation lines.
+        Also strips $ inline comments (ngspice extension).
         """
         processed = []
         i = 0
         while i < len(raw_lines):
-            line = raw_lines[i].rstrip()
+            line = self._strip_inline_comment(raw_lines[i].rstrip())
             while (i + 1 < len(raw_lines)
                    and raw_lines[i + 1]
                    and raw_lines[i + 1][0] == "+"):
                 i += 1
-                cont = raw_lines[i].rstrip()
+                cont = self._strip_inline_comment(raw_lines[i].rstrip())
                 line = line + " " + (cont[1:].strip() if len(cont) > 1 else "")
             processed.append(line)
             i += 1
@@ -139,10 +178,29 @@ class SpiceFlattener:
 
             upper = line.upper().strip()
 
-            if upper.startswith(".SUBCKT"):
+            # SPICE 3F5 sec2: .END terminates the netlist; everything after
+            # is outside the circuit description and must be ignored.
+            # Must check before .ENDS (which is a different directive).
+            if (upper.startswith(".END")
+                    and not upper.startswith(".ENDS")
+                    and not upper.startswith(".ENDL")):
+                if is_top_level:
+                    self.top_level_lines.append(line)
+                break
+
+            elif upper.startswith(".SUBCKT"):
                 subckt, end_idx = self._parse_subcircuit(lines, i)
                 self.subcircuits[subckt.name.upper()] = subckt
                 i = end_idx + 1
+
+            elif upper.startswith(".MODEL"):
+                # Record the model name so it is never mistaken for a net.
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    self.model_names.add(parts[1].upper())
+                if is_top_level:
+                    self.top_level_lines.append(line)
+                i += 1
 
             elif upper.startswith(".INCLUDE") or upper.startswith(".INC"):
                 fname = self._parse_include(line)
@@ -187,7 +245,13 @@ class SpiceFlattener:
             raise ValueError(f"Invalid .SUBCKT line: {header}")
 
         subckt_name = tokens[1]
-        ports = tokens[2:]
+        # Ports are all tokens after the name, stopping at PARAMS: / PARAMETERS:
+        # (parameterized subcircuit syntax — parameters are discarded here).
+        ports = []
+        for tok in tokens[2:]:
+            if tok.upper().rstrip(':') in ('PARAMS', 'PARAMETERS'):
+                break
+            ports.append(tok)
 
         body_lines = []
         i = start_idx + 1
@@ -197,15 +261,21 @@ class SpiceFlattener:
             upper = line.upper().strip()
             if upper.startswith(".SUBCKT"):
                 depth += 1
+                if depth == 2:
+                    # Nested subcircuit: parse and register it immediately.
+                    # This allows inner subcircuits to be used by X instances
+                    # anywhere in the netlist (not just after their definition).
+                    inner, end_idx = self._parse_subcircuit(lines, i)
+                    self.subcircuits[inner.name.upper()] = inner
+                    i = end_idx
+                    # Don't descend further — _parse_subcircuit handled it.
+                    depth -= 1  # restore: we consumed the matching .ENDS
+                    continue
             elif upper.startswith(".ENDS"):
                 depth -= 1
                 if depth == 0:
                     break
             elif upper.startswith(".GLOBAL") and depth == 1:
-                # .GLOBAL at this subcircuit's immediate body level — register
-                # so these nets are never prefixed during flattening.
-                # depth > 1 means we are inside a nested .SUBCKT definition;
-                # those globals belong to a tighter scope and are not promoted.
                 for gnode in line.strip().split()[1:]:
                     self.global_nodes.add(gnode.upper())
             if depth > 0:
@@ -312,6 +382,10 @@ class SpiceFlattener:
                     self.subcircuits[subckt.name.upper()] = subckt
                     i = end_idx + 1
                     continue
+                elif upper.startswith(".MODEL"):
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        self.model_names.add(parts[1].upper())
                 elif upper.startswith(".GLOBAL"):
                     # .GLOBAL inside a .LIB section — same treatment as top-level.
                     for gnode in line.strip().split()[1:]:
@@ -332,6 +406,16 @@ class SpiceFlattener:
             return [instance_line]
 
         instance_name = tokens[0]
+
+        # Strip PARAMS: / PARAMETERS: section from the token list.
+        # Parameterized X instances: "X1 n1 n2 MyCell PARAMS: a=1 b=2"
+        # The port-matching logic must only see the node tokens, not param=val.
+        clean_tokens = []
+        for tok in tokens:
+            if tok.upper().rstrip(':') in ('PARAMS', 'PARAMETERS'):
+                break   # everything from here is parameter overrides
+            clean_tokens.append(tok)
+        tokens = clean_tokens
 
         # Find the subcircuit name — last token matching a known definition
         subckt_name = None
@@ -401,6 +485,37 @@ class SpiceFlattener:
         else:
             new_name = (f"{prefix}_{device_name}" if prefix else device_name)
 
+        # ── K (mutual inductance): tokens[1] and tokens[2] are inductor
+        # device names, not net names.  Rename them the same way device
+        # names are prefixed rather than through _rename_node.
+        if dtype == "K":
+            new_tokens = [new_name]
+            for j in range(1, min(3, len(tokens))):
+                lnam = tokens[j]
+                if prefix and len(lnam) > 1:
+                    new_tokens.append(f"{lnam[0]}_{prefix}_{lnam[1:]}")
+                else:
+                    new_tokens.append(lnam)
+            new_tokens.extend(tokens[3:])   # coupling coefficient, unchanged
+            return " ".join(new_tokens)
+
+        # ── F (CCCS) / H (CCVS): tokens[3] is the controlling voltage-source
+        # device name (Vnam), which must be renamed as a device, not a net.
+        if dtype in ("F", "H"):
+            new_tokens = [new_name]
+            # N+ and N- are real circuit nodes
+            for j in range(1, min(3, len(tokens))):
+                new_tokens.append(self._rename_node(tokens[j], port_map, prefix))
+            # Vnam at tokens[3] is a device reference — rename as a device name
+            if len(tokens) > 3:
+                vnam = tokens[3]
+                if prefix and len(vnam) > 1:
+                    new_tokens.append(f"{vnam[0]}_{prefix}_{vnam[1:]}")
+                else:
+                    new_tokens.append(vnam)
+            new_tokens.extend(tokens[4:])   # gain, etc., unchanged
+            return " ".join(new_tokens)
+
         node_count, _ = self._device_node_count(dtype, tokens)
         new_tokens    = [new_name]
         for i in range(1, min(node_count + 1, len(tokens))):
@@ -428,6 +543,9 @@ class SpiceFlattener:
 
     def _rename_node(self, node: str, port_map: dict[str, str],
                      prefix: str) -> str:
+        # Model names must never be renamed — they are not circuit nodes.
+        if node.upper() in self.model_names:
+            return node
         # port_map keys are lowercase; compare case-insensitively.
         mapped = port_map.get(node.lower())
         if mapped is not None:
@@ -441,20 +559,21 @@ class SpiceFlattener:
     # node counts per SPICE 3F5 device letter
     _NODE_COUNT: dict[str, int] = {
         "M": 4,  # MOSFET: D G S B
-        "Q": 3,  # BJT:    C B E  (optional S not counted here)
+        "Q": 4,  # BJT:    C B E [S]  — substrate S is optional but renamed when present
         "J": 3,  # JFET:   D G S
         "Z": 3,  # MESFET: D G S
         "D": 2,  # Diode:  N+ N-
         "R": 2,  # Resistor
         "C": 2,  # Capacitor
         "L": 2,  # Inductor
-        "K": 2,  # Mutual inductor (references, not nets — kept for completeness)
+        # K (mutual inductor) is NOT listed here — it references inductor device
+        # names (not net names) and is handled as a special case in _rename_line.
         "V": 2,  # V source
         "I": 2,  # I source
         "E": 4,  # VCVS:  N+ N- NC+ NC-
         "G": 4,  # VCCS:  N+ N- NC+ NC-
-        "F": 2,  # CCCS:  N+ N-  (VNAM is not a node)
-        "H": 2,  # CCVS:  N+ N-  (VNAM is not a node)
+        # F and H are NOT listed here — they have a controlling V-source reference
+        # (Vnam) that is a device name, not a net, handled specially in _rename_line.
         "B": 2,  # Nonlinear source: N+ N-
         "S": 4,  # Voltage switch: N+ N- NC+ NC-
         "W": 2,  # Current switch: N+ N-

@@ -55,6 +55,31 @@ class NgspiceRunner:
         self.ngspice_bin = ngspice_bin
         self.timeout = timeout
 
+    def _find_voltage_source_for_node(self, netlist, node_name):
+        """
+        Find the voltage or current source device that drives a given node.
+
+        The .DC command requires a SOURCE NAME (e.g. "Vin"), not a node name
+        (e.g. "inp"). This helper maps node names to source device names so
+        that callers can pass either form.
+
+        Returns:
+            str: Source device name (e.g. "Vin", "Isrc") if found,
+                 otherwise the original node_name unchanged.
+        """
+        for line in netlist.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('*') or line.startswith('.'):
+                continue
+            if line[0].upper() not in ('V', 'I'):
+                continue
+            tokens = line.split()
+            if len(tokens) < 3:
+                continue
+            if tokens[1].lower() == node_name.lower():
+                return tokens[0]
+        return node_name
+
     def dc_sweep(self, netlist, sweep_params):
         """
         Run DC sweep analysis
@@ -160,6 +185,271 @@ quit
 .end
 """
         return deck
+
+    def dc_sweep_2d(self, netlist, sweep_params):
+        """
+        Run a 2D nested DC sweep analysis.
+
+        Args:
+            netlist: SPICE netlist as string
+            sweep_params: Dict with:
+                - sweep_var_1: Outer sweep variable (source name or node name)
+                - start_1, stop_1, step_1: Outer sweep range/step
+                - sweep_var_2: Inner sweep variable (source name or node name)
+                - start_2, stop_2, step_2: Inner sweep range/step
+                - observe: List of node names to observe
+
+        Returns:
+            dict: {
+                sweep_var_1: 1D array of unique outer values,
+                sweep_var_2: 1D array of unique inner values,
+                obs_var:     2D array of shape (n_outer, n_inner),
+                ...
+            }
+        """
+        for strategy_idx, strategy in enumerate(self.RETRY_STRATEGIES):
+            try:
+                return self._run_dc_sweep_2d_once(netlist, sweep_params, strategy)
+            except NgspiceError as e:
+                if strategy_idx == len(self.RETRY_STRATEGIES) - 1:
+                    raise NgspiceError(
+                        f"All retry strategies failed. Last error: {e}")
+
+    def _run_dc_sweep_2d_once(self, netlist, sweep_params, strategy):
+        deck = self._build_dc_sweep_2d_deck(netlist, sweep_params, strategy)
+        output = self._execute_ngspice(deck)
+        results = self._parse_dc_sweep_2d_output(
+            output,
+            sweep_params['sweep_var_1'],
+            sweep_params['sweep_var_2'],
+            sweep_params['observe'],
+        )
+        if not results or len(results.get(sweep_params['sweep_var_1'], [])) == 0:
+            raise NgspiceError("No data points in 2D simulation output")
+        return results
+
+    def _build_dc_sweep_2d_deck(self, netlist, sweep_params, strategy):
+        sv1 = sweep_params['sweep_var_1']
+        sv2 = sweep_params['sweep_var_2']
+        observe = sweep_params['observe']
+
+        # Resolve node names → source device names for the .dc command.
+        src1 = self._find_voltage_source_for_node(netlist, sv1)
+        src2 = self._find_voltage_source_for_node(netlist, sv2)
+
+        observe_list = [v for v in observe if v not in (sv1, sv2)]
+        options_line = (f".options {strategy['options']}\n"
+                        if 'options' in strategy else "")
+
+        return f"""* Auto-generated 2D DC sweep deck
+{netlist}
+
+{options_line}
+.dc {src1} {sweep_params['start_1']} {sweep_params['stop_1']} {sweep_params['step_1']} {src2} {sweep_params['start_2']} {sweep_params['stop_2']} {sweep_params['step_2']}
+
+.control
+run
+print {sv1} {sv2} {' '.join(observe_list)}
+quit
+.endc
+
+.end
+"""
+
+    def _parse_dc_sweep_2d_output(self, output, sweep_var_1, sweep_var_2,
+                                   observe_vars):
+        """
+        Parse ngspice 2D DC sweep output.
+
+        ngspice splits the run into one table per outer-sweep step.  Each
+        table has a header line starting with "Index" followed by a dashes
+        separator and then data rows.  Column names are matched against the
+        variables we care about (case-insensitive, stripping the "v-" prefix
+        that ngspice sometimes prepends).
+        """
+        all_vars  = [sweep_var_1, sweep_var_2] + list(observe_vars)
+        all_data  = {v: [] for v in all_vars}
+
+        lines           = output.split('\n')
+        current_header  = None
+        in_data_section = False
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                in_data_section = False
+                continue
+
+            if line.startswith('Index'):
+                current_header  = line.split()
+                in_data_section = False
+                continue
+
+            if line.startswith('---'):
+                in_data_section = True
+                continue
+
+            if in_data_section and current_header:
+                tokens = line.split()
+                if len(tokens) < 2:
+                    continue
+                try:
+                    values = [float(t) for t in tokens[1:]]   # skip index
+                    for i, col in enumerate(current_header[1:]):
+                        if i >= len(values):
+                            break
+                        norm_col = col.lower().lstrip('v').lstrip('-')
+                        for var in all_vars:
+                            if (norm_col == var.lower()
+                                    or col.lower() == var.lower()):
+                                all_data[var].append(values[i])
+                                break
+                except (ValueError, IndexError):
+                    continue
+
+        import numpy as np
+        sv1_arr = np.array(all_data[sweep_var_1])
+        sv2_arr = np.array(all_data[sweep_var_2])
+
+        if len(sv1_arr) == 0 or len(sv2_arr) == 0:
+            return {}
+
+        unique_1 = np.unique(sv1_arr)
+        unique_2 = np.unique(sv2_arr)
+        n1, n2   = len(unique_1), len(unique_2)
+
+        results = {sweep_var_1: unique_1, sweep_var_2: unique_2}
+        for var in observe_vars:
+            flat = np.array(all_data[var])
+            results[var] = flat.reshape((n1, n2)) if len(flat) == n1 * n2 else flat
+
+        return results
+
+    def ac_sweep(self, netlist, ac_params):
+        """
+        Run an AC frequency sweep analysis (.AC).
+
+        Args:
+            netlist: SPICE netlist (DC bias already set, AC source declared)
+            ac_params: Dict with:
+                - sweep_type:   'dec' | 'oct' | 'lin'  (default 'dec')
+                - n_points:     points per decade/octave, or total for 'lin'
+                                (default 10)
+                - start_freq:   start frequency in Hz (default 1)
+                - stop_freq:    stop frequency in Hz  (default 1e9)
+                - input_node:   node driven by the AC source (default 'vin')
+                - output_nodes: list of nodes to measure
+                - ac_magnitude: AC source magnitude     (default 1.0)
+
+        Returns:
+            dict: {
+                'frequency': np.array,
+                node_name: {
+                    'magnitude_db': np.array,
+                    'magnitude':    np.array (linear),
+                    'phase':        np.array (degrees)
+                }, ...
+            }
+        """
+        deck   = self._build_ac_sweep_deck(netlist, ac_params)
+        output = self._execute_ngspice(deck)
+        return self._parse_ac_sweep_output(output, ac_params.get('output_nodes', []))
+
+    def _build_ac_sweep_deck(self, netlist, ac_params):
+        sweep_type   = ac_params.get('sweep_type', 'dec')
+        n_points     = ac_params.get('n_points', 10)
+        start_freq   = ac_params.get('start_freq', 1)
+        stop_freq    = ac_params.get('stop_freq', 1e9)
+        input_node   = ac_params.get('input_node', 'vin')
+        output_nodes = ac_params.get('output_nodes', [])
+        ac_mag       = ac_params.get('ac_magnitude', 1.0)
+
+        # Add AC specification to the V source driving input_node if not
+        # already present in the netlist.
+        if f'ac {ac_mag}' not in netlist.lower():
+            modified = []
+            for ln in netlist.split('\n'):
+                if (input_node.lower() in ln.lower()
+                        and ln.strip() and ln.strip()[0].upper() == 'V'):
+                    ln = ln.rstrip() + (
+                        f' AC {ac_mag}' if 'dc' in ln.lower()
+                        else f' DC 0 AC {ac_mag}')
+                modified.append(ln)
+            netlist = '\n'.join(modified)
+
+        observe_list = []
+        for node in output_nodes:
+            nc = node.replace('net:', '')
+            observe_list += [f'vdb({nc})', f'vp({nc})']
+
+        return f"""* Auto-generated AC sweep deck
+{netlist}
+
+.ac {sweep_type} {n_points} {start_freq} {stop_freq}
+
+.control
+run
+print frequency {' '.join(observe_list)}
+quit
+.endc
+
+.end
+"""
+
+    def _parse_ac_sweep_output(self, output, output_nodes):
+        """
+        Parse ngspice AC sweep output.
+
+        Returns dict keyed by node name (without 'net:' prefix); each value
+        is a sub-dict with 'magnitude_db', 'magnitude', and 'phase' arrays,
+        plus a top-level 'frequency' array.
+        """
+        import numpy as np
+        results = {'frequency': []}
+        for node in output_nodes:
+            nc = node.replace('net:', '')
+            results[nc] = {'magnitude_db': [], 'magnitude': [], 'phase': []}
+
+        lines           = output.split('\n')
+        in_data_section = False
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('---'):
+                in_data_section = True
+                continue
+            if not in_data_section:
+                continue
+
+            tokens = line.split()
+            if len(tokens) < 3:
+                continue
+            try:
+                values = [float(t) for t in tokens[1:]]
+                if not values:
+                    continue
+                results['frequency'].append(values[0])
+                for i, node in enumerate(output_nodes):
+                    nc = node.replace('net:', '')
+                    base = i * 2 + 1
+                    if base + 1 < len(values):
+                        mag_db = values[base]
+                        phase  = values[base + 1]
+                        results[nc]['magnitude_db'].append(mag_db)
+                        results[nc]['magnitude'].append(10 ** (mag_db / 20))
+                        results[nc]['phase'].append(phase)
+            except (ValueError, IndexError):
+                continue
+
+        results['frequency'] = np.array(results['frequency'])
+        for node in output_nodes:
+            nc = node.replace('net:', '')
+            for key in ('magnitude_db', 'magnitude', 'phase'):
+                results[nc][key] = np.array(results[nc][key])
+
+        return results
 
     def dc_op(self, netlist, observe_vars):
         """

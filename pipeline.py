@@ -16,6 +16,7 @@ Requires: ngspice on PATH, and one of:
 """
 
 import re
+import math
 from pathlib import Path
 from ngspice_runner import NgspiceRunner, NgspiceError
 from ai_agent import create_agent, generate, refine, compute_nrmse, evaluate_va_code
@@ -27,6 +28,30 @@ except ImportError:
 
 MAX_ITERATIONS  = 3
 NRMSE_THRESHOLD = 0.05
+
+
+# ── Inline comment stripping ────────────────────────────────────────────
+
+def _strip_dollar_comment(line: str) -> str:
+    """
+    Strip ngspice/HSPICE $ inline comments, respecting quoted strings.
+
+    Per the ngspice manual, '$' starts a comment unless inside a quoted
+    string.  SPICE 3F5 does not define this character; this handles the
+    ubiquitous real-world convention.
+    """
+    in_quote = False
+    quote_char = None
+    for idx, ch in enumerate(line):
+        if ch in ('"', "'") and not in_quote:
+            in_quote = True
+            quote_char = ch
+        elif in_quote and ch == quote_char:
+            in_quote = False
+            quote_char = None
+        elif ch == '$' and not in_quote:
+            return line[:idx].rstrip()
+    return line
 
 
 # ── SPICE number / voltage parsing ─────────────────────────────────────
@@ -51,16 +76,26 @@ def _parse_spice_number(s):
     """
     Parse a SPICE numeric string including optional scale suffix.
 
+    Returns float('nan') for parameter expressions ({expr} or 'expr') and
+    any other string that cannot be parsed as a number.  Callers that use
+    nan values for sorting or comparison must handle them explicitly.
+
     Examples:
-        "5"       → 5.0
-        "1.8"     → 1.8
-        "5k"      → 5000.0
-        "1.5meg"  → 1500000.0
-        "100n"    → 1e-7
-        "3.14e-6" → 3.14e-6
-        "1.8V"    → 1.8   (unit suffix V is not a scale, silently ignored)
+        "5"         → 5.0
+        "1.8"       → 1.8
+        "5k"        → 5000.0
+        "1.5meg"    → 1500000.0
+        "100n"      → 1e-7
+        "3.14e-6"   → 3.14e-6
+        "1.8V"      → 1.8   (unit suffix V is not a scale, silently ignored)
+        "{VDD}"     → nan   (parameter expression — value unknown at parse time)
+        "'1.8'"     → nan   (HSPICE quoted expression)
+        "Vbias"     → nan   (bare parameter name)
     """
     s = s.strip().lower()
+    # Detect parameter expressions that cannot be evaluated statically.
+    if not s or s[0] in ('{', "'"):
+        return float('nan')
     try:
         return float(s)
     except ValueError:
@@ -71,12 +106,15 @@ def _parse_spice_number(s):
     m = re.match(r"^([+-]?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][+-]?\d+)?)(meg|mil|[tgkmunpf])?", s)
     if m:
         return float(m.group(1)) * _SPICE_SCALE.get(m.group(2) or "", 1.0)
-    return 0.0
+    # Bare parameter name or unknown form — value unknowable at parse time.
+    return float('nan')
 
 
-# Keywords that may appear as the 4th token of a V-source line but are NOT
-# a bare DC value.
-_VSRC_KEYWORDS = {"AC", "PULSE", "SIN", "EXP", "PWL", "SFFM", "DISTOF1", "DISTOF2"}
+# Keywords that may appear as the 4th token of a V/I source line but are NOT
+# a bare DC value.  (Renamed from _VSRC_KEYWORDS to cover I sources too.)
+_SRC_KEYWORDS = {"AC", "PULSE", "SIN", "EXP", "PWL", "SFFM", "DISTOF1", "DISTOF2"}
+# Keep old name as alias for test-suite compatibility.
+_VSRC_KEYWORDS = _SRC_KEYWORDS
 
 def _parse_spice_dc_voltage(line):
     """
@@ -98,11 +136,11 @@ def _parse_spice_dc_voltage(line):
     """
     norm = _normalize_seps(line)
 
-    # Explicit DC keyword: capture number + optional scale suffix
-    m = re.search(
-        r"\bDC\s+([+-]?[\d.]+(?:[eE][+-]?\d+)?(?:meg|mil|[tgkmunpf])?)",
-        norm, re.I,
-    )
+    # Explicit DC keyword: capture any non-whitespace token after DC.
+    # Using \S+ (instead of a numeric-only pattern) lets _parse_spice_number
+    # return nan for parameter expressions like {VDD} rather than silently
+    # falling through to the implicit-DC path and returning 0.0.
+    m = re.search(r"\bDC\s+(\S+)", norm, re.I)
     if m:
         return _parse_spice_number(m.group(1))
 
@@ -112,10 +150,23 @@ def _parse_spice_dc_voltage(line):
     tokens = norm.split()
     if len(tokens) >= 4:
         tok = tokens[3].upper()
-        if tok not in _VSRC_KEYWORDS:
+        if tok not in _SRC_KEYWORDS:
             return _parse_spice_number(tokens[3])
 
     return 0.0
+
+
+def _parse_spice_dc_current(line):
+    """
+    Extract the DC current from a SPICE independent current source line.
+
+    I sources follow the same syntax as V sources:
+        I1 1 0 DC 1u           →  1e-6    (explicit DC keyword)
+        I1 1 0 1u              →  1e-6    (implicit DC — bare value)
+        I1 1 0 DC 0 AC 1m      →  0.0
+        I1 1 0 PULSE(0 1u ...) →  0.0     (transient-only source)
+    """
+    return _parse_spice_dc_voltage(line)
 
 
 # Ground node names: SPICE 3F5 specifies only "0"; "gnd" is a common
@@ -138,12 +189,14 @@ def parse_netlist(text):
 
     Sec 3 — Elements parsed:
       - V sources      : DC keyword optional; all scale suffixes (k/meg/u/n/…)
+      - I sources      : same syntax as V; used as signal_source when .DC names
+                         one, or when no V sources are present / all are supplies
       - MOSFET (M)     : D G S B model …
       - BJT   (Q)      : C B E [S] model …
       - JFET  (J)      : D G S model …
       - MESFET(Z)      : D G S model …
       - Diode (D)      : N+ N- model …  (N+ used as output candidate)
-      - All other elements (R/C/L/I/G/E/F/H/B/S/W/T/O/U/K) silently ignored
+      - All other elements (R/C/L/G/E/F/H/B/S/W/T/O/U/K) silently ignored
 
     Sec 3 — Subcircuits:
       - If spice_flatten is available, hierarchical netlists with .SUBCKT /
@@ -153,16 +206,14 @@ def parse_netlist(text):
 
     Sec 4 — Directives parsed:
       - .DC source start stop step  : sets signal_source directly (more reliable
-                                      than the lowest-voltage heuristic)
+                                      than the lowest-voltage heuristic); works
+                                      for both V and I sources named in the directive
       - .SUBCKT / .ENDS             : depth tracking
       - .END                        : stops parsing (spec: all content after .END
                                       is outside the netlist and must be ignored)
       - All other directives (.MODEL, .AC, .TRAN, .OP, .OPTIONS, …) skipped
 
     Known limitations (out of scope):
-      - I-source signal inputs : .DC Isrc 0 1u 10n has no matching V source,
-                                 so signal_source falls back to the lowest-DC-V
-                                 heuristic, which may pick a supply rail instead.
       - Dual/negative supply without .DC : e.g. VEE=-5 DC sorts below Vin=0 and
                                  is chosen as signal_source (wrong). Adding a
                                  .DC directive to the netlist fixes this.
@@ -177,7 +228,9 @@ def parse_netlist(text):
                                  "gnd" is accepted here as a common extension
                                  (ngspice/HSPICE) but other synonyms are not.
       - .PARAM / {expr} / PARAMS: : simulator-specific extensions, not SPICE 3F5.
-      - $ inline comments          : ngspice extension, not SPICE 3F5.
+                                 Parameterised DC values (e.g. DC {VDD}) are
+                                 returned as NaN; NaN sources sort last in the
+                                 heuristic and trigger the 1.8 V VDD default.
 
     Returns dict with:
         signal_source  — voltage source name to sweep  (e.g. "Vin")
@@ -192,8 +245,12 @@ def parse_netlist(text):
         text = _flatten_netlist(text)
 
     # ── Step 1: Join continuation lines ('+' must be in column 1) ──────
+    # Strip $ inline comments first so they don't interfere with continuation
+    # detection or element parsing (handles non-subckt netlists that bypass
+    # the spice_flatten pre-processing step which also strips $).
     joined = []
     for raw in text.splitlines():
+        raw = _strip_dollar_comment(raw)
         if raw.startswith("+") and joined:
             joined[-1] = joined[-1] + " " + raw[1:].strip()
         else:
@@ -203,7 +260,9 @@ def parse_netlist(text):
     # Per spec: the ABSOLUTE first line is unconditionally the circuit title —
     # even if blank or a comment — and is never parsed as an element.
     voltage_sources  = []   # (name, plus_node, dc_voltage)
+    current_sources  = []   # (name, plus_node, dc_current)
     transistors      = []   # {"drain": ..., "gate": ...}
+    dep_sources      = []   # {"out": ...}  — E/G/F/H/B output nodes
     diodes           = []   # {"anode": ..., "cathode": ...}
     dc_sweep_source  = None # source name from .DC directive, if present
     subckt_depth     = 0    # >0 means we are inside a .SUBCKT block
@@ -267,6 +326,11 @@ def parse_netlist(text):
             dc_v = _parse_spice_dc_voltage(stripped)
             voltage_sources.append((tokens[0], tokens[1].lower(), dc_v))
 
+        elif dtype == "I" and len(tokens) >= 3:
+            # Independent current source: I name N+ N- [DC] value …
+            dc_i = _parse_spice_dc_current(stripped)
+            current_sources.append((tokens[0], tokens[1].lower(), dc_i))
+
         elif dtype in ("M", "J", "Z") and len(tokens) >= 5:
             # M: Drain Gate Source Bulk  model …
             # J: Drain Gate Source       model …
@@ -285,43 +349,97 @@ def parse_netlist(text):
             diodes.append({"anode":   tokens[1].lower(),
                            "cathode": tokens[2].lower()})
 
-    if not voltage_sources:
-        raise ValueError("No voltage sources found in netlist")
+        elif dtype in ("E", "G") and len(tokens) >= 5:
+            # VCVS (E): N+ N- NC+ NC- gain  — N+ is the output
+            # VCCS (G): N+ N- NC+ NC- gain  — N+ is the output
+            dep_sources.append({"out": tokens[1].lower()})
 
-    voltage_sources.sort(key=lambda v: v[2])     # ascending by DC voltage
-    supply_src  = voltage_sources[-1]            # highest V → supply
+        elif dtype in ("F", "H") and len(tokens) >= 4:
+            # CCCS (F): N+ N- Vnam gain  — N+ is the output
+            # CCVS (H): N+ N- Vnam gain  — N+ is the output
+            dep_sources.append({"out": tokens[1].lower()})
 
-    supply_node = supply_src[1]                  # e.g. "vdd"
-    vdd         = supply_src[2] if supply_src[2] > 0 else 1.8
+        elif dtype == "B" and len(tokens) >= 3:
+            # Nonlinear source (B): N+ N- V=expr or I=expr  — N+ is the output
+            dep_sources.append({"out": tokens[1].lower()})
+
+    if not voltage_sources and not current_sources:
+        raise ValueError("No voltage or current sources found in netlist")
+
+    # ── Supply voltage: highest V source by DC value ─────────────────────
+    # Parameterised sources ({expr}) have dc_voltage=nan; treat nan as +inf
+    # so they never shadow a real supply but still appear in the list.
+    def _nan_to_inf(v):
+        return v if not math.isnan(v) else float('inf')
+
+    if voltage_sources:
+        voltage_sources.sort(key=lambda v: _nan_to_inf(v[2]))
+        supply_src  = voltage_sources[-1]           # highest numeric V → supply
+        supply_node = supply_src[1]                 # e.g. "vdd"
+        sv = supply_src[2]
+        vdd = sv if (not math.isnan(sv) and sv > 0.5) else 1.8
+    else:
+        supply_node = "vdd"
+        vdd         = 1.8   # current-only circuit: assume default supply
 
     # ── Signal source: .DC directive beats the heuristic ────────────────
+    # .DC can name either a V or an I source.
     signal_source = None
     if dc_sweep_source:
-        # Case-insensitive match against the V sources we found.
-        for vs in voltage_sources:
-            if vs[0].upper() == dc_sweep_source.upper():
-                signal_source = vs[0]
+        dn = dc_sweep_source.upper()
+        # Check V sources first, then I sources.
+        for src_list in (voltage_sources, current_sources):
+            for s in src_list:
+                if s[0].upper() == dn:
+                    signal_source = s[0]
+                    break
+            if signal_source:
                 break
         if signal_source is None:
-            # .DC names a source not present as a V element (e.g. a current
-            # source or a source inside a subcircuit) — fall back to heuristic.
-            signal_source = voltage_sources[0][0]
+            # .DC names a source not in the netlist (e.g. inside a .SUBCKT
+            # that was not flattened) — fall back to heuristic.
+            signal_source = (voltage_sources[0][0] if voltage_sources
+                             else current_sources[0][0])
     else:
-        signal_source = voltage_sources[0][0]    # lowest DC voltage = signal
+        # Heuristic: if I sources exist, prefer the one with lowest |DC|
+        # (current-mode circuits typically use Isrc as the swept input).
+        # Parameterised sources (nan) sort last so known-zero signals win.
+        # Otherwise use the V source with the lowest DC voltage.
+        if current_sources:
+            current_sources.sort(key=lambda i: _nan_to_inf(abs(i[2])))
+            signal_source = current_sources[0][0]
+        else:
+            signal_source = voltage_sources[0][0]   # lowest DC voltage = signal
 
-    # ── Output node: first device terminal not on ground or supply ───────
+    # ── Output node ───────────────────────────────────────────────────────
+    # Priority: transistors → dependent sources (E/G/F/H/B) → diodes.
+    # current_sources' positive node excluded (typically an input bias node).
+    i_src_nodes = {s[1] for s in current_sources}
+
+    def _is_valid_output(node):
+        return (node not in _GROUND_NODES
+                and node != supply_node
+                and node not in i_src_nodes)
+
     output_node = None
     for t in transistors:
-        if t["drain"] not in _GROUND_NODES and t["drain"] != supply_node:
+        if _is_valid_output(t["drain"]):
             output_node = t["drain"]
             break
     if output_node is None and transistors:
         output_node = transistors[0]["drain"]    # fallback to first transistor
 
-    # If no transistors found, try diode anodes as a last resort.
+    # Dependent sources: E/G/F/H/B output node
+    if output_node is None:
+        for ds in dep_sources:
+            if _is_valid_output(ds["out"]):
+                output_node = ds["out"]
+                break
+
+    # Diodes: last resort
     if output_node is None:
         for d in diodes:
-            if d["anode"] not in _GROUND_NODES and d["anode"] != supply_node:
+            if _is_valid_output(d["anode"]):
                 output_node = d["anode"]
                 break
 

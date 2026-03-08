@@ -176,6 +176,372 @@ def a_clean_code_passes_clean_input():
     assert clean_code(code) == code
 
 
+# ── I-source and new pipeline.py features ────────────────────────────
+
+def a_parse_netlist_with_current_source():
+    """parse_netlist picks the I source as signal when .DC names it."""
+    from pipeline import parse_netlist
+    netlist = """\
+* Current-mode test
+M1 vout vin 0 0 NMOS W=1u L=1u
+Ibias vin 0 DC 10u
+VDD vdd 0 DC 1.8
+.DC Ibias 0 100u 1u
+.model NMOS NMOS (LEVEL=1 VTO=0.4 KP=100u)
+"""
+    info = parse_netlist(netlist)
+    assert info["signal_source"].upper() == "IBIAS", info
+
+def a_parse_netlist_isource_heuristic():
+    """parse_netlist heuristic: lowest |DC| current source picked as signal."""
+    from pipeline import parse_netlist
+    netlist = """\
+* I-source only circuit (no .DC directive)
+Q1 vout vin 0 NPN
+Isig vin 0 DC 1u
+Ibig vcc 0 DC 1m
+.model NPN NPN (IS=1e-14 BF=100)
+"""
+    info = parse_netlist(netlist)
+    # Isig has smaller |DC| so should be chosen
+    assert info["signal_source"].upper() == "ISIG", info
+
+def a_parse_spice_dc_current_explicit():
+    """_parse_spice_dc_current handles explicit DC keyword."""
+    from pipeline import _parse_spice_dc_current
+    result = _parse_spice_dc_current("I1 vp vn DC 1u")
+    assert abs(result - 1e-6) < 1e-18
+
+def a_parse_spice_dc_current_implicit():
+    """_parse_spice_dc_current handles bare value (implicit DC)."""
+    from pipeline import _parse_spice_dc_current
+    result = _parse_spice_dc_current("I1 vp vn 500n")
+    assert abs(result - 5e-7) < 1e-19
+
+# ── spice_flatten new features ────────────────────────────────────────
+
+def a_spice_flatten_dollar_comment():
+    """$ inline comments are stripped during flattening."""
+    from spice_flatten import SpiceFlattener
+    netlist = """\
+Title
+R1 a b 1k $ this is a resistor inline comment
+M1 d g s b NMOS $ mosfet with comment
+"""
+    flat = SpiceFlattener()
+    flat.parse_text(netlist)
+    flat_text = flat.flatten_text()
+    assert "$" not in flat_text, f"$ not stripped:\n{flat_text!r}"
+    assert "R1" in flat_text
+    assert "M1" in flat_text
+
+def a_spice_flatten_dollar_comment_in_quoted_string():
+    """$ inside a quoted string must NOT be stripped."""
+    from spice_flatten import SpiceFlattener
+    line = 'R1 a b "my$net" $ real comment'
+    result = SpiceFlattener._strip_inline_comment(line)
+    # The real comment should be stripped but the quoted $ should remain
+    assert '"my$net"' in result
+    assert "real comment" not in result
+
+def a_spice_flatten_params_keyword():
+    """PARAMS: in X instances does not cause port mismatch errors."""
+    from spice_flatten import flatten_netlist
+    netlist = """\
+Title
+.SUBCKT myinv in out vdd vss
+M1 out in vdd vdd PMOS W=2u L=100n
+M2 out in vss vss NMOS W=1u L=100n
+.ENDS myinv
+X1 net_in net_out vdd 0 myinv PARAMS: W=2u L=100n
+VDD vdd 0 DC 1.8
+"""
+    flat = flatten_netlist(netlist)
+    # Should not raise; flat text should contain flattened transistors
+    assert "PMOS" in flat or "M1" in flat.upper() or "NMOS" in flat
+
+def a_spice_flatten_nested_subckt():
+    """Nested .SUBCKT definitions are registered and can be instantiated."""
+    from spice_flatten import flatten_netlist
+    netlist = """\
+Title
+.SUBCKT outer in out
+  .SUBCKT inner a b
+    R1 a b 1k
+  .ENDS inner
+  X_inner in out inner
+.ENDS outer
+Xouter vin vout outer
+Vin vin 0 DC 1
+"""
+    flat = flatten_netlist(netlist)
+    # R1 from the inner subckt should appear in the flattened result
+    assert "R1" in flat or "1k" in flat
+
+# ── ngspice_runner new helpers ────────────────────────────────────────
+
+def a_ngspice_find_source_for_node():
+    """_find_voltage_source_for_node maps node name to voltage source name."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    netlist = """\
+Title
+Vin vin 0 DC 0
+VDD vdd 0 DC 1.8
+"""
+    result = runner._find_voltage_source_for_node(netlist, "vin")
+    assert result.upper() == "VIN", f"Expected Vin, got {result}"
+
+def a_ngspice_find_source_isource():
+    """_find_voltage_source_for_node also finds I sources by their positive node."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    netlist = """\
+Title
+Ibias ibias_node 0 DC 1u
+VDD vdd 0 DC 1.8
+"""
+    result = runner._find_voltage_source_for_node(netlist, "ibias_node")
+    assert result.upper() == "IBIAS", f"Expected Ibias, got {result}"
+
+def a_ngspice_find_source_no_match():
+    """_find_voltage_source_for_node returns the node name when no source matches."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    netlist = """\
+Title
+VDD vdd 0 DC 1.8
+"""
+    result = runner._find_voltage_source_for_node(netlist, "vout")
+    assert result == "vout"
+
+
+# ── $ inline comments in parse_netlist (non-subckt path) ─────────────
+
+def a_parse_netlist_dollar_comment_stripped():
+    """$ comments in flat netlists are stripped before element parsing."""
+    from pipeline import parse_netlist
+    netlist = """\
+* Title line
+M1 vout vin 0 0 NMOS W=1u L=1u $ drain is the output
+VDD vdd 0 DC 1.8 $ supply
+Vin vin 0 DC 0 $ signal
+.model NMOS NMOS (LEVEL=1 VTO=0.4 KP=100u)
+"""
+    info = parse_netlist(netlist)
+    assert info["signal_source"].upper() == "VIN"
+    assert info["output_node"] == "vout"
+    assert info["vdd"] == _approx(1.8, abs_tol=0.01)
+
+
+# ── .PARAM / {expr} — NaN handling ───────────────────────────────────
+
+def a_parse_spice_number_param_expr_nan():
+    """_parse_spice_number returns nan for {expr} parameter expressions."""
+    import math
+    from pipeline import _parse_spice_number
+    assert math.isnan(_parse_spice_number("{VDD}"))
+    assert math.isnan(_parse_spice_number("'1.8'"))
+    assert math.isnan(_parse_spice_number("Vbias"))
+
+def a_parse_netlist_param_vdd_fallback():
+    """Parameterised VDD ({expr}) falls back to 1.8 V default."""
+    from pipeline import parse_netlist
+    netlist = """\
+* Parameterised supply
+.PARAM VDD=1.8
+M1 vout vin 0 0 NMOS W=1u L=1u
+VDD vdd 0 DC {VDD}
+Vin vin 0 DC 0
+.model NMOS NMOS (LEVEL=1 VTO=0.4 KP=100u)
+"""
+    info = parse_netlist(netlist)
+    # NaN-valued VDD falls to 1.8 default; real Vin (DC=0) wins as signal
+    assert info["signal_source"].upper() == "VIN"
+    assert info["vdd"] == _approx(1.8, abs_tol=0.01)
+
+def a_parse_netlist_param_signal_not_chosen():
+    """Parameterised V source (NaN DC) is not chosen as signal over a real 0 V source."""
+    from pipeline import parse_netlist
+    netlist = """\
+* Parameterised signal test
+M1 vout vin 0 0 NMOS W=1u L=1u
+Vparam vbias 0 DC {Vbias}
+Vin vin 0 DC 0
+VDD vdd 0 DC 1.8
+.model NMOS NMOS (LEVEL=1 VTO=0.4 KP=100u)
+"""
+    info = parse_netlist(netlist)
+    # Vparam has NaN → sorts last; Vin with DC=0 is the real signal
+    assert info["signal_source"].upper() == "VIN"
+
+
+# ── Dependent source output node detection ───────────────────────────
+
+def a_parse_netlist_evcvs_output_node():
+    """E (VCVS) output node is detected when no transistors present."""
+    from pipeline import parse_netlist
+    netlist = """\
+* Simple VCVS amplifier
+E1 vout 0 vin 0 10
+VDD vdd 0 DC 1.8
+Vin vin 0 DC 0
+"""
+    info = parse_netlist(netlist)
+    assert info["output_node"] == "vout", info
+
+def a_parse_netlist_bsource_output_node():
+    """B (nonlinear source) output node is detected when no transistors present."""
+    from pipeline import parse_netlist
+    netlist = """\
+* Nonlinear B source
+B1 vout 0 V=tanh(V(vin))
+VDD vdd 0 DC 1.8
+Vin vin 0 DC 0
+"""
+    info = parse_netlist(netlist)
+    assert info["output_node"] == "vout", info
+
+
+# ── spice_flatten: .END terminates parsing ────────────────────────────
+
+def a_spice_flatten_end_stops_parsing():
+    """.END terminates flattening; elements after it are ignored."""
+    from spice_flatten import flatten_netlist
+    netlist = """\
+Title
+R1 a b 1k
+.END
+* Everything below should be ignored
+R2 c d 99k
+"""
+    flat = flatten_netlist(netlist)
+    assert "R1" in flat
+    assert "R2" not in flat
+
+def a_spice_flatten_end_in_subckt_file():
+    """.END stops parsing so garbage after it doesn't cause errors."""
+    from spice_flatten import SpiceFlattener
+    netlist = """\
+Title
+.SUBCKT mymod a b
+R1 a b 1k
+.ENDS mymod
+.END
+.SUBCKT phantom x y
+R2 x y 99k
+.ENDS phantom
+"""
+    f = SpiceFlattener()
+    f.parse_text(netlist)
+    # phantom subcircuit defined after .END must NOT be registered
+    assert "PHANTOM" not in f.subcircuits
+
+
+# ── spice_flatten: .MODEL tracking prevents model-name renaming ───────
+
+def a_spice_flatten_model_name_not_renamed():
+    """Model names declared with .MODEL are never prefixed as if they were nets."""
+    from spice_flatten import flatten_netlist
+    netlist = """\
+Title
+.SUBCKT inv in out vdd vss
+M1 out in vdd vdd PMOS W=2u L=100n
+M2 out in vss vss NMOS W=1u L=100n
+.ENDS inv
+.MODEL PMOS PMOS (LEVEL=1 VTO=-0.5 KP=50u)
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.4 KP=100u)
+X1 vin vout vdd 0 inv
+VDD vdd 0 DC 1.8
+"""
+    flat = flatten_netlist(netlist)
+    # Model names PMOS and NMOS must appear unchanged, not prefixed
+    assert "PMOS" in flat
+    assert "NMOS" in flat
+    # Prefixed versions must NOT appear
+    assert "X1_PMOS" not in flat and "_PMOS" not in flat.replace("PMOS", "")
+    assert "X1_NMOS" not in flat and "_NMOS" not in flat.replace("NMOS", "")
+
+
+# ── spice_flatten: Q BJT 4th (substrate) terminal renamed ─────────────
+
+def a_spice_flatten_bjt_4terminal_renamed():
+    """Q BJT substrate (4th) node is correctly renamed inside a subcircuit."""
+    from spice_flatten import flatten_netlist
+    netlist = """\
+Title
+.SUBCKT bjt_cell in out sub
+Q1 out in 0 sub NPN
+.ENDS bjt_cell
+.MODEL NPN NPN (IS=1e-14 BF=100)
+X1 vin vout vsub bjt_cell
+Vin vin 0 DC 0
+"""
+    flat = flatten_netlist(netlist)
+    # The substrate port 'sub' maps to connected node 'vsub' at the instance
+    assert "vsub" in flat, f"vsub not found in flat netlist:\n{flat}"
+    # The model name NPN must remain unmodified
+    assert "NPN" in flat
+
+
+# ── spice_flatten: F source Vnam correctly renamed ────────────────────
+
+def a_spice_flatten_f_source_vnam_renamed():
+    """F (CCCS) controlling V-source reference is renamed with the subcircuit prefix."""
+    from spice_flatten import flatten_netlist
+    netlist = """\
+Title
+.SUBCKT cccs_cell in out
+Vsense in 0 DC 0
+F1 out 0 Vsense 10
+.ENDS cccs_cell
+X1 vin vout cccs_cell
+Vin vin 0 DC 0
+"""
+    flat = flatten_netlist(netlist)
+    # Vsense inside cccs_cell should be renamed to V_X1_sense (or similar prefixed form)
+    # The F1 reference should match — check that the un-prefixed "Vsense" is not used
+    # as the F1 Vnam while "V_X1_sense" is the actual device name
+    lines = [l.strip() for l in flat.splitlines() if l.strip() and not l.strip().startswith("*")]
+    f_line = next((l for l in lines if l.upper().startswith("F")), None)
+    v_line = next((l for l in lines if l.upper().startswith("V") and "SENSE" in l.upper()), None)
+    assert f_line is not None, f"No F device in flat netlist:\n{flat}"
+    assert v_line is not None, f"No Vsense device in flat netlist:\n{flat}"
+    # Both lines should reference the same (prefixed) V-source name
+    f_tokens = f_line.split()
+    v_tokens = v_line.split()
+    assert len(f_tokens) >= 4, f"F line malformed: {f_line}"
+    assert f_tokens[3].upper() == v_tokens[0].upper(), (
+        f"F Vnam '{f_tokens[3]}' does not match V device name '{v_tokens[0]}'"
+    )
+
+
+# ── spice_flatten: K mutual inductor L-names renamed ─────────────────
+
+def a_spice_flatten_k_mutual_renamed():
+    """K mutual inductor L1/L2 device references are renamed with the subcircuit prefix."""
+    from spice_flatten import flatten_netlist
+    netlist = """\
+Title
+.SUBCKT coupled_pair a b c d
+L1 a b 1u
+L2 c d 1u
+K12 L1 L2 0.9
+.ENDS coupled_pair
+X1 n1 n2 n3 n4 coupled_pair
+Vin n1 0 DC 0
+"""
+    flat = flatten_netlist(netlist)
+    lines = [l.strip() for l in flat.splitlines() if l.strip() and not l.strip().startswith("*")]
+    k_line = next((l for l in lines if l.upper().startswith("K")), None)
+    assert k_line is not None, f"No K device in flat netlist:\n{flat}"
+    k_tokens = k_line.split()
+    assert len(k_tokens) >= 3, f"K line malformed: {k_line}"
+    # The L references in K must have been prefixed (not bare "L1" / "L2")
+    assert k_tokens[1] != "L1", f"L1 not renamed in K line: {k_line}"
+    assert k_tokens[2] != "L2", f"L2 not renamed in K line: {k_line}"
+
+
 # ══════════════════════════════════════════════════════════════════════
 # GROUP B — Feedback loop with mocked AI + ngspice
 # ══════════════════════════════════════════════════════════════════════
@@ -451,6 +817,40 @@ def run_tests(groups, model=None):
         run("[A] clean_code strips ``` markdown",      a_clean_code_strips_markdown)
         run("[A] clean_code strips verilog-ams fence", a_clean_code_strips_verilogams_fence)
         run("[A] clean_code passes clean input",       a_clean_code_passes_clean_input)
+        # I-source / pipeline.py additions
+        run("[A] parse_netlist: .DC names I source",   a_parse_netlist_with_current_source)
+        run("[A] parse_netlist: I-source heuristic",   a_parse_netlist_isource_heuristic)
+        run("[A] _parse_spice_dc_current explicit DC", a_parse_spice_dc_current_explicit)
+        run("[A] _parse_spice_dc_current implicit DC", a_parse_spice_dc_current_implicit)
+        # spice_flatten additions
+        run("[A] spice_flatten: $ comments stripped",  a_spice_flatten_dollar_comment)
+        run("[A] spice_flatten: $ in quoted str kept", a_spice_flatten_dollar_comment_in_quoted_string)
+        run("[A] spice_flatten: PARAMS: on X line",    a_spice_flatten_params_keyword)
+        run("[A] spice_flatten: nested .SUBCKT",       a_spice_flatten_nested_subckt)
+        # ngspice_runner additions
+        run("[A] ngspice: find V source for node",     a_ngspice_find_source_for_node)
+        run("[A] ngspice: find I source for node",     a_ngspice_find_source_isource)
+        run("[A] ngspice: find source no match",       a_ngspice_find_source_no_match)
+        # $ inline comments in parse_netlist (non-subckt path)
+        run("[A] parse_netlist: $ stripped (no subckt)",a_parse_netlist_dollar_comment_stripped)
+        # .PARAM / {expr} NaN handling
+        run("[A] _parse_spice_number: {expr} → nan",   a_parse_spice_number_param_expr_nan)
+        run("[A] parse_netlist: {VDD} falls back 1.8V",a_parse_netlist_param_vdd_fallback)
+        run("[A] parse_netlist: param src not chosen", a_parse_netlist_param_signal_not_chosen)
+        # Dependent source output node detection
+        run("[A] parse_netlist: E source output node", a_parse_netlist_evcvs_output_node)
+        run("[A] parse_netlist: B source output node", a_parse_netlist_bsource_output_node)
+        # spice_flatten: .END termination
+        run("[A] spice_flatten: .END stops parsing",   a_spice_flatten_end_stops_parsing)
+        run("[A] spice_flatten: .END ignores phantom", a_spice_flatten_end_in_subckt_file)
+        # spice_flatten: .MODEL tracking
+        run("[A] spice_flatten: model names not renamed",a_spice_flatten_model_name_not_renamed)
+        # spice_flatten: Q 4-terminal BJT
+        run("[A] spice_flatten: BJT 4th terminal",     a_spice_flatten_bjt_4terminal_renamed)
+        # spice_flatten: F source Vnam
+        run("[A] spice_flatten: F Vnam renamed",       a_spice_flatten_f_source_vnam_renamed)
+        # spice_flatten: K mutual inductance
+        run("[A] spice_flatten: K L-refs renamed",     a_spice_flatten_k_mutual_renamed)
 
     # ── Group B ──────────────────────────────────────────────────────
     if "B" in groups:
