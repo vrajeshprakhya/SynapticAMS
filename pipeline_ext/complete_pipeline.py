@@ -22,7 +22,14 @@ from pipeline_ext.fit_transfer_function import fit_transfer_function
 from pipeline_ext.verilog_ams_generator import VerilogAMSGenerator
 from pipeline_ext.extract_small_signal_model import extract_small_signal_model
 from equivalence_checker import EquivalenceChecker
-from equivalence_checker_osdi import OSDIEquivalenceChecker
+
+# OSDI equivalence checking is optional (requires OpenVAF)
+try:
+    from equivalence_checker_osdi import OSDIEquivalenceChecker
+    OSDI_AVAILABLE = True
+except ImportError:
+    OSDI_AVAILABLE = False
+    OSDIEquivalenceChecker = None
 
 def spice_to_verilog_ams(netlist_text, output_dir='.'):
     """
@@ -369,10 +376,15 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
             elif 'intent:' in line.lower():
                 print(f"        {line.strip()}")
 
-    # Step 7: Check equivalence using OSDI
-    print("\n[7/8] Checking equivalence with OSDI...")
-    osdi_checker = OSDIEquivalenceChecker(abs_tol=0.01, rel_tol=0.05)
+    # Step 7: Check equivalence using OSDI (optional)
     equivalence_results = []
+
+    if OSDI_AVAILABLE:
+        print("\n[7/8] Checking equivalence with OSDI...")
+        osdi_checker = OSDIEquivalenceChecker(abs_tol=0.01, rel_tol=0.05)
+    else:
+        print("\n[7/8] Skipping OSDI equivalence check (OpenVAF not available)...")
+        print("      Install OpenVAF for equivalence validation")
 
     for i, fitted_model in enumerate(fitted_models):
         # Handle both 1D and 2D models
@@ -394,24 +406,26 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
         # Extract output name
         output_name = fitted_model['output'].replace('net:', '')
 
-        try:
-            result = osdi_checker.check_equivalence(
-                netlist_text, code, module_name,
-                input_names=input_names,
-                output_names=[output_name],
-                n_test_points=20
-            )
-            equivalence_results.append({
-                'module': module_name,
-                'result': result
-            })
-            status = "✓" if result.passed else "✗"
-            print(f"      {status} {module_name}: " +
-                  f"max_err={result.max_absolute_error:.2e}, " +
-                  f"corr={result.correlation:.3f}, " +
-                  f"n={result.n_points}")
-        except Exception as e:
-            print(f"      ⚠ {module_name}: equivalence check failed ({e})")
+        # Only run OSDI check if available
+        if OSDI_AVAILABLE:
+            try:
+                result = osdi_checker.check_equivalence(
+                    netlist_text, code, module_name,
+                    input_names=input_names,
+                    output_names=[output_name],
+                    n_test_points=20
+                )
+                equivalence_results.append({
+                    'module': module_name,
+                    'result': result
+                })
+                status = "✓" if result.passed else "✗"
+                print(f"      {status} {module_name}: " +
+                      f"max_err={result.max_absolute_error:.2e}, " +
+                      f"corr={result.correlation:.3f}, " +
+                      f"n={result.n_points}")
+            except Exception as e:
+                print(f"      ⚠ {module_name}: equivalence check failed ({e})")
 
     # Step 8: Save files
     print("\n[8/8] Saving files to disk...")
