@@ -5,10 +5,18 @@ ngspice_runner.py
 Executes ngspice simulations and parses results into numpy arrays.
 
 Handles:
-- DC sweep analysis
+- DC sweep analysis (1D and 2D nested)
+- AC small-signal sweep analysis
 - DC operating point analysis
 - Convergence error recovery with retry strategies
 - Output parsing from ngspice text format
+
+ngspice manual references (v45):
+- .DC syntax:    §11.3.2  — srcnam vstart vstop vincr [src2 ...]
+- .AC syntax:    §11.3.1  — dec/oct/lin n fstart fstop
+- .OP syntax:    §11.3.5
+- .options:      §11.1    — RELTOL/ABSTOL/GMIN/RSHUNT/SRCSTEPS/ITL1/ITL2
+- print command: §13.5.59 — scale vector always printed as first column
 """
 
 import subprocess
@@ -28,21 +36,36 @@ class NgspiceRunner:
     Executes ngspice simulations and parses results
     """
 
-    # Retry strategies for convergence failures
+    # Retry strategies for convergence failures.
+    # Each dict supplies an .options line inserted into the deck.
+    # References: ngspice manual §11.1.2 (OP/DC options), §11.1.4 (SRCSTEPS).
     RETRY_STRATEGIES = [
-        # Strategy 0: Default settings
+        # Strategy 0: Default settings — let ngspice use its own auto-aids
+        #             (built-in gmin stepping + source stepping per §11.3.5)
         {},
 
-        # Strategy 1: Tighter tolerances
+        # Strategy 1: Tighter tolerances — can help circuits that oscillate
+        #             around the solution due to floating-point noise.
+        #             RELTOL default 1e-3; ABSTOL default 1e-12 (§11.1.2).
         {'options': 'reltol=1e-5 abstol=1e-13'},
 
-        # Strategy 2: Gmin stepping
+        # Strategy 2: Add shunt resistors (RSHUNT) to resolve floating nodes /
+        #             ill-conditioned matrices (§11.1.2.1).  RSHUNT requires
+        #             ngspice to be compiled with XSPICE support (standard in
+        #             all major distributions).  1 TΩ value per manual example.
+        #             Also raises GMIN to add small conductances to all devices.
         {'options': 'gmin=1e-11 rshunt=1e12'},
 
-        # Strategy 3: Different integration method
-        {'options': 'method=gear'},
+        # Strategy 3: Increase DC iteration limits.  ITL1 is the per-step DC
+        #             iteration limit (default 100); ITL2 is the DC transfer-
+        #             curve limit (default 50).  Per §11.1.2.
+        #             NOTE: method=gear was previously used here but that option
+        #             only applies to TRANSIENT analysis (§11.1.4) and has no
+        #             effect on DC sweeps.
+        {'options': 'itl1=200 itl2=100'},
 
-        # Strategy 4: Source stepping (for DC)
+        # Strategy 4: Explicit source stepping.  SRCSTEPS forces all supplies
+        #             to ramp from 0 → 100% in the given number of steps (§11.1.2).
         {'options': 'srcsteps=10'},
     ]
 
@@ -54,6 +77,35 @@ class NgspiceRunner:
         """
         self.ngspice_bin = ngspice_bin
         self.timeout = timeout
+
+    @staticmethod
+    def _strip_end_directive(netlist: str) -> str:
+        """
+        Remove .END lines from a netlist string before embedding it in a
+        simulation deck.
+
+        Per SPICE 3F5 §2, .END marks the absolute end of the circuit
+        description.  When the netlist text is embedded inside a larger deck
+        (which adds .DC / .AC / .control / .endc / .end of its own), any .END
+        in the embedded portion would terminate parsing of the *entire* deck
+        before the analysis commands are reached — causing a silent simulation
+        failure where ngspice exits with no data.
+
+        Preserves:
+          .ENDS  — subcircuit end directive
+          .ENDL  — library section end directive
+        """
+        out = []
+        for line in netlist.splitlines():
+            upper = line.strip().upper()
+            is_end = (
+                upper.startswith('.END')
+                and not upper.startswith('.ENDS')
+                and not upper.startswith('.ENDL')
+            )
+            if not is_end:
+                out.append(line)
+        return '\n'.join(out)
 
     def _find_voltage_source_for_node(self, netlist, node_name):
         """
@@ -169,9 +221,15 @@ class NgspiceRunner:
         if 'options' in strategy:
             options_line = f".options {strategy['options']}\n"
 
+        # Strip any .END directives from the embedded netlist.  Per SPICE 3F5
+        # §2, .END terminates the *entire* input file; if the user's netlist
+        # contains .END and we embed it verbatim, ngspice stops parsing before
+        # it ever reaches the .dc / .control commands below.
+        clean_netlist = self._strip_end_directive(netlist)
+
         # Build complete deck
         deck = f"""* Auto-generated DC sweep deck
-{netlist}
+{clean_netlist}
 
 {options_line}
 .dc {sweep_var} {start} {stop} {step}
@@ -241,8 +299,11 @@ quit
         options_line = (f".options {strategy['options']}\n"
                         if 'options' in strategy else "")
 
+        # Strip .END before embedding (see _build_dc_sweep_deck for rationale).
+        clean_netlist = self._strip_end_directive(netlist)
+
         return f"""* Auto-generated 2D DC sweep deck
-{netlist}
+{clean_netlist}
 
 {options_line}
 .dc {src1} {sweep_params['start_1']} {sweep_params['stop_1']} {sweep_params['step_1']} {src2} {sweep_params['start_2']} {sweep_params['stop_2']} {sweep_params['step_2']}
@@ -298,10 +359,17 @@ quit
                     for i, col in enumerate(current_header[1:]):
                         if i >= len(values):
                             break
-                        norm_col = col.lower().lstrip('v').lstrip('-')
+                        # Normalise the column header to a plain node name so
+                        # we can match it against the variable names we asked
+                        # for.  ngspice may output:
+                        #   "vin"      — bare name (most common in control mode)
+                        #   "v(vin)"   — parenthesised form (some versions)
+                        #   "v-sweep"  — the automatic scale column (skip)
+                        col_lo   = col.lower()
+                        vm = re.match(r'^v\(([^)]+)\)$', col_lo)
+                        norm_col = vm.group(1) if vm else col_lo
                         for var in all_vars:
-                            if (norm_col == var.lower()
-                                    or col.lower() == var.lower()):
+                            if norm_col == var.lower() or col_lo == var.lower():
                                 all_data[var].append(values[i])
                                 break
                 except (ValueError, IndexError):
@@ -324,6 +392,136 @@ quit
             results[var] = flat.reshape((n1, n2)) if len(flat) == n1 * n2 else flat
 
         return results
+
+    # ── Transient analysis ───────────────────────────────────────────────
+
+    def tran_sweep(self, netlist, tran_params):
+        """
+        Run transient analysis (.TRAN) with a PULSE-injected signal source.
+
+        Characterizes circuit dynamics by replacing the named signal source
+        with a PULSE waveform and recording the time-domain response.
+
+        This method is a standalone tool for functional verification and
+        circuit characterization.  Static Verilog-AMS behavioral models
+        (V(out) <+ f(V(in))) cannot match transient waveforms, so tran_sweep
+        results are NOT fed into the AI NRMSE loop — use dc_sweep for that.
+
+        Args:
+            netlist: SPICE netlist as string
+            tran_params: Dict with:
+                - tstep:         Output time step (seconds)
+                - tstop:         Stop time (seconds)
+                - observe:       List of node names to record
+                - signal_source: Device name to replace with PULSE (e.g. 'Vin')
+                - tstart:        Output start time (default 0.0)
+                - v_low:         PULSE low voltage  (default 0.0)
+                - v_high:        PULSE high voltage (default 1.8)
+                - pulse_delay:   PULSE TD  (default tstop * 0.1)
+                - pulse_rise:    PULSE TR  (default tstep)
+                - pulse_fall:    PULSE TF  (default tstep)
+                - pulse_width:   PULSE PW  (default tstop * 0.4)
+                - pulse_period:  PULSE PER (default tstop)
+
+        Returns:
+            dict: {'time': np.array, node_name: np.array, ...}
+
+        Per ngspice manual §11.3.3: .tran tstep tstop <tstart>
+        PULSE syntax per §4.1: PULSE(v1 v2 td tr tf pw per)
+        Output format per §13.5.59: same tabular format as DC sweep,
+        with 'time' as the scale vector (first column after Index).
+        """
+        for strategy_idx, strategy in enumerate(self.RETRY_STRATEGIES):
+            try:
+                deck    = self._build_tran_deck(netlist, tran_params, strategy)
+                output  = self._execute_ngspice(deck)
+                observe = tran_params['observe']
+                results = self._parse_tran_output(output, observe)
+                if not results or len(results.get('time', [])) == 0:
+                    raise NgspiceError("No data points in transient simulation output")
+                return results
+            except NgspiceError as e:
+                if strategy_idx == len(self.RETRY_STRATEGIES) - 1:
+                    raise NgspiceError(
+                        f"All retry strategies failed. Last error: {e}")
+
+    def _build_tran_deck(self, netlist, tran_params, strategy):
+        """
+        Build complete SPICE deck for transient analysis.
+
+        Replaces the named signal source with a PULSE waveform (§4.1):
+            Vname N+ N- PULSE(v_low v_high delay rise fall width period)
+
+        Device name matching uses tokens[0].upper() == signal_src.upper()
+        (exact, not substring) — same guard used in _build_ac_sweep_deck
+        to prevent corrupting unrelated sources such as 'VDD vin_supply 0'.
+        """
+        tstep        = tran_params['tstep']
+        tstop        = tran_params['tstop']
+        tstart       = tran_params.get('tstart', 0.0)
+        observe      = tran_params['observe']
+        signal_src   = tran_params['signal_source']
+        v_low        = tran_params.get('v_low',        0.0)
+        v_high       = tran_params.get('v_high',       1.8)
+        pulse_delay  = tran_params.get('pulse_delay',  tstop * 0.1)
+        pulse_rise   = tran_params.get('pulse_rise',   tstep)
+        pulse_fall   = tran_params.get('pulse_fall',   tstep)
+        pulse_width  = tran_params.get('pulse_width',  tstop * 0.4)
+        pulse_period = tran_params.get('pulse_period', tstop)
+
+        # Replace signal source with PULSE stimulus.  Keep only the first
+        # three tokens (device, N+, N-) and append the PULSE specification.
+        pulse_spec = (f"PULSE({v_low} {v_high} {pulse_delay} "
+                      f"{pulse_rise} {pulse_fall} "
+                      f"{pulse_width} {pulse_period})")
+        modified = []
+        for ln in netlist.split('\n'):
+            stripped = ln.strip()
+            if stripped and not stripped.startswith('*') and not stripped.startswith('.'):
+                tokens = stripped.split()
+                if tokens and tokens[0].upper() == signal_src.upper():
+                    if len(tokens) >= 3:
+                        ln = f"{tokens[0]} {tokens[1]} {tokens[2]} {pulse_spec}"
+            modified.append(ln)
+        netlist_modified = '\n'.join(modified)
+
+        # Strip .END before embedding (see _build_dc_sweep_deck for rationale).
+        clean_netlist = self._strip_end_directive(netlist_modified)
+
+        options_line  = (f".options {strategy['options']}\n"
+                         if 'options' in strategy else "")
+        observe_list  = ' '.join(observe)
+        tstart_clause = f" {tstart}" if tstart != 0.0 else ""
+
+        return f"""* Auto-generated transient sweep deck
+{clean_netlist}
+
+{options_line}
+.tran {tstep} {tstop}{tstart_clause}
+
+.control
+run
+print {observe_list}
+quit
+.endc
+
+.end
+"""
+
+    def _parse_tran_output(self, output, observe_vars):
+        """
+        Parse ngspice transient (.TRAN) output.
+
+        The tabular format produced by the .control 'print' command is
+        identical to DC sweep output (§13.5.59): the scale vector ('time')
+        is always the first data column (after the Index column).
+
+        Delegates to _parse_dc_sweep_output with sweep_var='time'.
+
+        Returns:
+            dict: {'time': np.array, node_name: np.array, ...}
+        """
+        return self._parse_dc_sweep_output(output, 'time', observe_vars)
 
     def ac_sweep(self, netlist, ac_params):
         """
@@ -364,22 +562,47 @@ quit
         output_nodes = ac_params.get('output_nodes', [])
         ac_mag       = ac_params.get('ac_magnitude', 1.0)
 
-        # Add AC specification to the V source driving input_node if not
+        # Add AC specification to the V or I source driving input_node if not
         # already present in the netlist.
-        if f'ac {ac_mag}' not in netlist.lower():
+        #
+        # Guard check: scan source lines (V or I, per §4.1/§4.2) for an
+        # existing 'AC' keyword.  A simple f'ac {ac_mag}' substring search
+        # fails if the netlist already has 'AC 1' (integer) but ac_mag=1.0
+        # (float).  A bare 'ac' search would falsely match the '.ac' analysis
+        # command itself, so we restrict the check to source element lines.
+        _ac_already_set = any(
+            re.search(r'\bAC\b', ln, re.I)
+            for ln in netlist.splitlines()
+            if ln.strip() and ln.strip()[0].upper() in ('V', 'I')
+        )
+        if not _ac_already_set:
             modified = []
             for ln in netlist.split('\n'):
-                if (input_node.lower() in ln.lower()
-                        and ln.strip() and ln.strip()[0].upper() == 'V'):
-                    ln = ln.rstrip() + (
-                        f' AC {ac_mag}' if 'dc' in ln.lower()
-                        else f' DC 0 AC {ac_mag}')
+                stripped = ln.strip()
+                # Handle both V sources (§4.1) and I sources (§4.2):
+                # both accept the same AC <ACMAG <ACPHASE>> syntax.
+                # Use token-level matching (tokens[1] == input_node) rather
+                # than a substring search to avoid accidentally modifying the
+                # wrong source (e.g. 'VDD vin_supply 0' when input_node='vin').
+                if stripped and stripped[0].upper() in ('V', 'I'):
+                    tokens = stripped.split()
+                    # tokens[0]=device, tokens[1]=N+ (positive node per §4.1/§4.2)
+                    if (len(tokens) >= 2
+                            and tokens[1].lower() == input_node.lower()):
+                        ln = ln.rstrip() + (
+                            f' AC {ac_mag}' if 'dc' in ln.lower()
+                            else f' DC 0 AC {ac_mag}')
                 modified.append(ln)
             netlist = '\n'.join(modified)
+
+        # Strip .END before embedding (see _build_dc_sweep_deck for rationale).
+        netlist = self._strip_end_directive(netlist)
 
         observe_list = []
         for node in output_nodes:
             nc = node.replace('net:', '')
+            # vdb() and vp() are per ngspice manual §11.6.2:
+            # VDB = 20·log10(magnitude), VP = phase in degrees.
             observe_list += [f'vdb({nc})', f'vp({nc})']
 
         return f"""* Auto-generated AC sweep deck
@@ -462,9 +685,12 @@ quit
         Returns:
             dict: {var_name: value, ...}
         """
+        # Strip .END before embedding (see _build_dc_sweep_deck for rationale).
+        clean_netlist = self._strip_end_directive(netlist)
+
         # Build complete SPICE deck
         deck = f"""* Auto-generated DC OP deck
-{netlist}
+{clean_netlist}
 
 .op
 
@@ -523,8 +749,13 @@ quit
                     f"stderr: {result.stderr}"
                 )
 
-            # Check for convergence errors
-            if 'convergence' in result.stderr.lower():
+            # Check for convergence errors.  Use the specific phrase "no
+            # convergence" rather than bare "convergence": ngspice may print
+            # informational messages about convergence aids being applied
+            # (gmin stepping, source stepping) even when the simulation
+            # ultimately succeeds, so a bare 'convergence' match would
+            # produce false positives and discard good data.
+            if 'no convergence' in result.stderr.lower():
                 raise NgspiceError(f"Convergence failure: {result.stderr}")
 
             return result.stdout
@@ -693,9 +924,12 @@ quit
         # Build show commands for all devices
         show_commands = '\n'.join([f"show {dev}" for dev in device_names])
 
+        # Strip .END before embedding (see _build_dc_sweep_deck for rationale).
+        clean_netlist = self._strip_end_directive(netlist)
+
         # Build complete SPICE deck
         deck = f"""* Auto-generated AC parameter extraction
-{netlist}
+{clean_netlist}
 
 .op
 
@@ -756,10 +990,15 @@ quit
             if in_device_section and line_stripped.startswith('device') and device_name.lower() not in line_stripped.lower():
                 break
 
-            # Parse parameters within device section
+            # Parse parameters within device section.
+            # Use a word-boundary check so that "gm" does NOT match "gmb" lines.
+            # (plain startswith('gm') would match both "gm  6e-5" and "gmb  0")
             if in_device_section:
                 for param in ['gm', 'gds', 'gmb']:
-                    if line_stripped.startswith(param):
+                    # Match the parameter name followed by whitespace or EOL
+                    if (line_stripped == param
+                            or line_stripped.startswith(param + ' ')
+                            or line_stripped.startswith(param + '\t')):
                         tokens = line_stripped.split()
                         if len(tokens) >= 2:
                             try:

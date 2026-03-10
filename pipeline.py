@@ -17,6 +17,7 @@ Requires: ngspice on PATH, and one of:
 
 import re
 import math
+import numpy as np
 from pathlib import Path
 from ngspice_runner import NgspiceRunner, NgspiceError
 from ai_agent import create_agent, generate, refine, compute_nrmse, evaluate_va_code
@@ -450,6 +451,68 @@ def parse_netlist(text):
     }
 
 
+# ── DC behavioral metrics ───────────────────────────────────────────────
+
+def _extract_dc_metrics(x, y, vdd):
+    """
+    Compute key DC behavioral metrics from a DC sweep result.
+
+    Pure numpy — no additional ngspice call.  Called from run_pipeline
+    immediately after dc_sweep returns.
+
+    Metrics:
+      voh  — output-high voltage: y[0]  (output at lowest sweep input)
+      vol  — output-low  voltage: y[-1] (output at highest sweep input)
+      vth  — input threshold: first x where Vout crosses (VOH+VOL)/2,
+             found by linear interpolation of sign-change crossings
+      gain — peak |dVout/dVin|: max of |diff(y)/diff(x)| across sweep
+
+    Edge cases handled:
+      - Flat output (y constant): gain=0, vth=midpoint of sweep
+      - No midpoint crossing: vth=x at index closest to midpoint
+      - Single-point sweep: gain=0, vth=x[0]
+
+    Args:
+        x:   1D numpy array of input values (e.g. Vin, V)
+        y:   1D numpy array of output values (e.g. Vout, V)
+        vdd: supply voltage (float) — for context, not used in math
+
+    Returns:
+        dict: {'voh': float, 'vol': float, 'vth': float, 'gain': float}
+    """
+    voh      = float(y[0])
+    vol      = float(y[-1])
+    midpoint = (voh + vol) / 2.0
+
+    # Switching threshold: first crossing of (VOH+VOL)/2 by linear interp
+    vth = float(x[len(x) // 2])          # fallback: midpoint of sweep range
+    diff_from_mid = y - midpoint
+    for i in range(len(diff_from_mid) - 1):
+        if diff_from_mid[i] * diff_from_mid[i + 1] <= 0:
+            dy = float(diff_from_mid[i + 1] - diff_from_mid[i])
+            if abs(dy) > 1e-15:
+                t   = -float(diff_from_mid[i]) / dy
+                vth = float(x[i]) + t * float(x[i + 1] - x[i])
+            else:
+                vth = float(x[i])
+            break
+    else:
+        # No crossing found — use x at index closest to midpoint
+        vth = float(x[int(np.argmin(np.abs(diff_from_mid)))])
+
+    # Peak gain: max |dVout/dVin|; guard against zero-length dx steps
+    if len(x) >= 2:
+        dx_arr   = np.diff(x.astype(float))
+        dy_arr   = np.diff(y.astype(float))
+        nonzero  = dx_arr != 0
+        gain     = float(np.max(np.abs(dy_arr[nonzero] / dx_arr[nonzero]))) \
+                   if np.any(nonzero) else 0.0
+    else:
+        gain = 0.0
+
+    return {'voh': voh, 'vol': vol, 'vth': vth, 'gain': gain}
+
+
 # ── Main pipeline ──────────────────────────────────────────────────────
 
 def run_pipeline(netlist_text, output_dir=".",
@@ -501,10 +564,19 @@ def run_pipeline(netlist_text, output_dir=".",
         print(f"      Failed: {e}")
         print("      Continuing with netlist-only AI generation.")
 
+    # Compute DC behavioral metrics from sweep data (pure numpy, no extra
+    # ngspice run).  These are passed to the AI to anchor key operating
+    # points (VOH, VOL, Vth, gain) in the generated Verilog-AMS model.
+    metrics = None
+    if x is not None and y is not None:
+        metrics = _extract_dc_metrics(x, y, info["vdd"])
+        print(f"      VOH={metrics['voh']:.3f}V  VOL={metrics['vol']:.3f}V  "
+              f"Vth={metrics['vth']:.3f}V  Gain={metrics['gain']:.1f}V/V")
+
     # ── Step 3: AI generation + feedback loop ────────────────────────
     print("\n[3/4] AI Agent generating Verilog-AMS...")
     agent   = create_agent(provider=provider, model=ai_model)
-    va_code = generate(agent, netlist_text, x, y, info)
+    va_code = generate(agent, netlist_text, x, y, info, metrics=metrics)
 
     final_nrmse = None
     if x is not None and y is not None:

@@ -542,6 +542,342 @@ Vin n1 0 DC 0
     assert k_tokens[2] != "L2", f"L2 not renamed in K line: {k_line}"
 
 
+# ── ngspice_runner: .END stripping and manual-compliance fixes ────────
+
+def a_ngspice_strip_end_directive_removes_end():
+    """_strip_end_directive removes standalone .END lines."""
+    from ngspice_runner import NgspiceRunner
+    netlist = "Title\nVin vin 0 DC 0\n.END\n"
+    result = NgspiceRunner._strip_end_directive(netlist)
+    assert ".END" not in result.upper().splitlines()[-1] if result.strip() else True
+    # More precisely: no line is exactly ".END" (case-insensitive)
+    for line in result.splitlines():
+        upper = line.strip().upper()
+        assert upper != ".END", f"Found .END in stripped netlist: {result!r}"
+
+
+def a_ngspice_strip_end_directive_keeps_ends():
+    """_strip_end_directive preserves .ENDS and .ENDL directives."""
+    from ngspice_runner import NgspiceRunner
+    netlist = "Title\n.SUBCKT foo a b\nR1 a b 1k\n.ENDS foo\n.END\n"
+    result = NgspiceRunner._strip_end_directive(netlist)
+    assert ".ENDS" in result.upper(), f".ENDS was removed:\n{result}"
+    for line in result.splitlines():
+        upper = line.strip().upper()
+        assert upper != ".END", f"Bare .END survived stripping: {result!r}"
+
+
+def a_ngspice_deck_strips_end_before_analysis():
+    """DC sweep deck builder removes .END so ngspice sees .dc command."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    netlist = "Title\nVin vin 0 DC 0\nVDD vdd 0 DC 1.8\nM1 vout vin 0 0 NMOS W=1u L=1u\n.model NMOS NMOS\n.END\n"
+    sweep_params = {
+        'sweep_var': 'Vin',
+        'start': 0.0,
+        'stop': 1.8,
+        'step': 0.1,
+        'observe': ['vout'],
+    }
+    deck = runner._build_dc_sweep_deck(netlist, sweep_params, {})
+    lines = deck.splitlines()
+    # Find index of any bare .END (not .end that terminates the whole deck)
+    end_indices   = [i for i, l in enumerate(lines) if l.strip().upper() == '.END']
+    dc_indices    = [i for i, l in enumerate(lines) if l.strip().lower().startswith('.dc ')]
+    assert dc_indices, f"No .dc command found in deck:\n{deck}"
+    # The embedded .END from the netlist must be gone; only the final .end we add should remain
+    assert len(end_indices) <= 1, f"Too many .END lines — embedded one wasn't removed:\n{deck}"
+    if end_indices:
+        assert end_indices[0] > dc_indices[0], \
+            f".END appears before .dc (embedded .END not stripped):\n{deck}"
+
+
+def a_ngspice_ac_injection_token_match():
+    """AC injection adds 'AC' to the correct source using token[1] matching."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    netlist = "Title\nVin vin 0 DC 0\nVDD vdd 0 DC 1.8\n"
+    ac_params = {
+        'input_node': 'vin',
+        'sweep_type': 'dec',
+        'n_points': 10,
+        'start_freq': 1,
+        'stop_freq': 1e9,
+        'output_nodes': ['vout'],
+        'ac_magnitude': 1.0,
+    }
+    deck = runner._build_ac_sweep_deck(netlist, ac_params)
+    # The Vin line should now contain AC
+    vin_lines = [l for l in deck.splitlines() if l.strip().upper().startswith('VIN ')]
+    assert vin_lines, f"Vin line not found in deck:\n{deck}"
+    assert 'AC' in vin_lines[0].upper(), \
+        f"AC not injected into Vin line: {vin_lines[0]!r}"
+
+
+def a_ngspice_ac_injection_no_false_match():
+    """AC injection does NOT modify a source whose node name contains input_node as substring."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    # VDD's positive node is 'vin_supply' — contains 'vin' as substring.
+    # Vin's positive node is 'vin' exactly — should be the only one modified.
+    netlist = "Title\nVin vin 0 DC 0\nVDD vin_supply 0 DC 1.8\n"
+    ac_params = {
+        'input_node': 'vin',
+        'sweep_type': 'dec',
+        'n_points': 10,
+        'start_freq': 1,
+        'stop_freq': 1e9,
+        'output_nodes': [],
+        'ac_magnitude': 1.0,
+    }
+    deck = runner._build_ac_sweep_deck(netlist, ac_params)
+    # VDD line must NOT have AC injected
+    vdd_lines = [l for l in deck.splitlines() if l.strip().upper().startswith('VDD ')]
+    assert vdd_lines, f"VDD line not found in deck:\n{deck}"
+    assert 'AC' not in vdd_lines[0].upper(), \
+        f"AC was falsely injected into VDD line: {vdd_lines[0]!r}"
+
+
+def a_ngspice_gm_not_clobbered_by_gmb():
+    """_parse_ac_params_output returns correct gm even when gmb appears on next line."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    # Simulate real ngspice 'show' output where gm and gmb are adjacent
+    output = """\
+device                    m1
+  model                  nmos
+     gm             6.216e-05
+    gds               3.6e-07
+    gmb                     0
+"""
+    result = runner._parse_ac_params_output(output, 'm1')
+    assert abs(result['gm'] - 6.216e-05) < 1e-10, \
+        f"gm was clobbered by gmb: gm={result['gm']}"
+    assert result['gmb'] == 0.0, f"gmb should be 0.0, got {result['gmb']}"
+    assert abs(result['gds'] - 3.6e-07) < 1e-15, \
+        f"gds wrong: {result['gds']}"
+
+
+def a_ngspice_strategy3_is_dc_iteration():
+    """Strategy 3 uses ITL1/ITL2 (DC iteration limits) not method=gear (transient-only)."""
+    from ngspice_runner import NgspiceRunner
+    strategy3 = NgspiceRunner.RETRY_STRATEGIES[3]
+    opts = strategy3.get('options', '')
+    assert 'itl1' in opts.lower(), \
+        f"Strategy 3 should set itl1, got options: {opts!r}"
+    assert 'itl2' in opts.lower(), \
+        f"Strategy 3 should set itl2, got options: {opts!r}"
+    assert 'method' not in opts.lower(), \
+        f"Strategy 3 must not use method=gear (transient-only), got: {opts!r}"
+
+
+# ── ngspice_runner: convergence detection, AC injection fixes ─────────
+
+def a_ngspice_convergence_check_no_false_positive():
+    """Convergence check uses 'no convergence' not bare 'convergence' to avoid false positives."""
+    import types
+    from unittest.mock import patch
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    # Simulate ngspice stderr that mentions convergence aids SUCCESSFULLY applied.
+    # The word "convergence" appears, but NOT "no convergence" — must NOT raise.
+    fake_result = types.SimpleNamespace(
+        returncode=0,
+        stdout="Index  v-sweep  vout\n---\n0  0.0  1.8\n",
+        stderr="Note: Gmin stepping for convergence aids applied. Convergence assisted.",
+    )
+    with patch('subprocess.run', return_value=fake_result):
+        output = runner._execute_ngspice("* dummy")
+        assert output == fake_result.stdout, "Expected stdout to be returned"
+
+
+def a_ngspice_convergence_check_triggers_on_failure():
+    """Convergence check raises NgspiceError when 'no convergence' appears in stderr."""
+    import types
+    from unittest.mock import patch
+    from ngspice_runner import NgspiceRunner, NgspiceError
+    runner = NgspiceRunner()
+    fake_result = types.SimpleNamespace(
+        returncode=0,
+        stdout="",
+        stderr="doiter: no convergence in DC analysis after 100 iterations at node vout",
+    )
+    with patch('subprocess.run', return_value=fake_result):
+        try:
+            runner._execute_ngspice("* dummy")
+            assert False, "Expected NgspiceError to be raised"
+        except NgspiceError as e:
+            assert 'convergence' in str(e).lower(), f"Expected convergence in error: {e}"
+
+
+def a_ngspice_ac_injection_existing_ac_integer():
+    """AC injection is skipped when source already has 'AC 1' (integer, not float 1.0)."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    # Source already has AC 1 (integer form) — must NOT inject again
+    netlist = "Title\nVin vin 0 DC 0 AC 1\nVDD vdd 0 DC 1.8\n"
+    ac_params = {
+        'input_node': 'vin',
+        'sweep_type': 'dec',
+        'n_points': 10,
+        'start_freq': 1,
+        'stop_freq': 1e9,
+        'output_nodes': [],
+        'ac_magnitude': 1.0,   # float — old code checked for 'ac 1.0' which ≠ 'ac 1'
+    }
+    deck = runner._build_ac_sweep_deck(netlist, ac_params)
+    vin_lines = [l for l in deck.splitlines() if l.strip().upper().startswith('VIN ')]
+    assert vin_lines, f"Vin line not found in deck:\n{deck}"
+    # Should have exactly one 'AC' keyword on the Vin line, not two
+    ac_count = vin_lines[0].upper().count(' AC ')
+    assert ac_count <= 1, \
+        f"AC was injected twice (old bug: 'ac 1.0' != 'ac 1'): {vin_lines[0]!r}"
+
+
+def a_ngspice_ac_injection_i_source():
+    """AC injection adds AC spec to an I source when it drives the input node (§4.2)."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    # I source drives the input node — should get AC injected
+    netlist = "Title\nIin iin_node 0 DC 1u\nVDD vdd 0 DC 1.8\n"
+    ac_params = {
+        'input_node': 'iin_node',
+        'sweep_type': 'dec',
+        'n_points': 10,
+        'start_freq': 1,
+        'stop_freq': 1e9,
+        'output_nodes': [],
+        'ac_magnitude': 1.0,
+    }
+    deck = runner._build_ac_sweep_deck(netlist, ac_params)
+    iin_lines = [l for l in deck.splitlines() if l.strip().upper().startswith('IIN ')]
+    assert iin_lines, f"Iin line not found in deck:\n{deck}"
+    assert 'AC' in iin_lines[0].upper(), \
+        f"AC not injected into I source line: {iin_lines[0]!r}"
+
+
+# ── tran_sweep deck and output parsing ────────────────────────────────
+
+def a_tran_deck_has_pulse_source():
+    """_build_tran_deck replaces the signal source with a PULSE specification."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    netlist = "Title\nVin vin 0 DC 0\nVDD vdd 0 DC 1.8\nM1 vout vin 0 0 NMOS W=1u L=1u\n.model NMOS NMOS\n"
+    tran_params = {
+        'tstep':         1e-9,
+        'tstop':         100e-9,
+        'signal_source': 'Vin',
+        'observe':       ['v(vout)'],
+        'v_low':         0.0,
+        'v_high':        1.8,
+    }
+    deck = runner._build_tran_deck(netlist, tran_params, {})
+    lines_upper = [l.upper() for l in deck.splitlines()]
+    # Signal source line must now contain PULSE
+    vin_lines = [l for l in lines_upper if l.strip().startswith('VIN ')]
+    assert vin_lines, f"Vin line not found in tran deck:\n{deck}"
+    assert 'PULSE' in vin_lines[0], f"PULSE not injected into Vin line: {vin_lines[0]!r}"
+    # Deck must contain a .tran command
+    assert any('.TRAN' in l for l in lines_upper), f"No .tran command in deck:\n{deck}"
+
+
+def a_tran_deck_strips_end():
+    """_build_tran_deck removes .END from embedded netlist so ngspice sees .tran."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    netlist = "Title\nVin vin 0 DC 0\nVDD vdd 0 DC 1.8\n.END\n"
+    tran_params = {
+        'tstep':         1e-9,
+        'tstop':         100e-9,
+        'signal_source': 'Vin',
+        'observe':       ['v(vout)'],
+    }
+    deck = runner._build_tran_deck(netlist, tran_params, {})
+    lines = deck.splitlines()
+    tran_indices = [i for i, l in enumerate(lines) if l.strip().lower().startswith('.tran ')]
+    end_indices  = [i for i, l in enumerate(lines) if l.strip().upper() == '.END']
+    assert tran_indices, f"No .tran command in deck:\n{deck}"
+    # Only the final .end we add should exist, and it must come after .tran
+    assert len(end_indices) <= 1, f"Embedded .END not stripped:\n{deck}"
+    if end_indices:
+        assert end_indices[0] > tran_indices[0], \
+            f".END before .tran — embedded .END was not stripped:\n{deck}"
+
+
+def a_tran_parse_output():
+    """_parse_tran_output correctly parses ngspice transient print output."""
+    from ngspice_runner import NgspiceRunner
+    runner = NgspiceRunner()
+    # Simulate typical ngspice .print tran output format (identical to DC)
+    output = """\
+Index  time           v(vout)
+------  ------         --------
+0      0.000000e+00   1.800000e+00
+1      1.000000e-09   1.750000e+00
+2      2.000000e-09   1.200000e+00
+3      3.000000e-09   4.000000e-01
+"""
+    result = runner._parse_tran_output(output, ['v(vout)'])
+    assert 'time' in result, f"'time' key not in result: {list(result)}"
+    assert 'v(vout)' in result or 'vout' in result, \
+        f"Output node not in result: {list(result)}"
+    time_key = 'time'
+    assert len(result[time_key]) == 4, \
+        f"Expected 4 time points, got {len(result[time_key])}"
+
+
+# ── _extract_dc_metrics ───────────────────────────────────────────────
+
+def a_extract_dc_metrics_inverter():
+    """_extract_dc_metrics computes VOH, VOL, Vth, gain for a synthetic inverter sweep."""
+    from pipeline import _extract_dc_metrics
+    x, y = make_sweep_data(n=51, vdd=1.8)
+    metrics = _extract_dc_metrics(x, y, vdd=1.8)
+    # VOH is y[0] (output when input=0): should be close to VDD
+    assert metrics['voh'] > 1.5, f"VOH too low: {metrics['voh']}"
+    # VOL is y[-1] (output when input=VDD): should be near 0
+    assert metrics['vol'] < 0.5, f"VOL too high: {metrics['vol']}"
+    # Vth should be somewhere in the middle of the input range
+    assert 0.3 < metrics['vth'] < 1.5, f"Vth out of range: {metrics['vth']}"
+    # Gain should be > 1 (amplifier)
+    assert metrics['gain'] > 1.0, f"Gain too low: {metrics['gain']}"
+
+
+def a_extract_dc_metrics_flat():
+    """_extract_dc_metrics returns 0.0 gain for a flat (unity-gain buffer) sweep."""
+    from pipeline import _extract_dc_metrics
+    x = np.linspace(0, 1.8, 51)
+    y = np.full_like(x, 1.0)   # flat output
+    metrics = _extract_dc_metrics(x, y, vdd=1.8)
+    assert metrics['voh'] == _approx(1.0, abs_tol=1e-9)
+    assert metrics['vol'] == _approx(1.0, abs_tol=1e-9)
+    assert metrics['gain'] == _approx(0.0, abs_tol=1e-9)
+
+
+# ── AI prompt includes metrics section ────────────────────────────────
+
+def a_prompt_includes_metrics():
+    """_build_prompt includes the 'Key DC Behavioral Metrics' section when metrics given."""
+    from ai_agent import _build_prompt
+    x, y = make_sweep_data()
+    info = {"signal_source": "Vin", "output_node": "vout", "vdd": 1.8}
+    metrics = {'voh': 1.8, 'vol': 0.0, 'vth': 0.65, 'gain': 12.5}
+    prompt = _build_prompt(COMMON_SOURCE, x, y, info, metrics=metrics)
+    assert "Key DC Behavioral Metrics" in prompt, \
+        "Metrics section header not found in prompt"
+    assert "VOH" in prompt, "VOH not in prompt"
+    assert "VOL" in prompt, "VOL not in prompt"
+    assert "Vth" in prompt, "Vth not in prompt"
+    assert "Gain" in prompt, "Gain not in prompt"
+    # Check that values are formatted
+    assert "1.8000" in prompt or "1.80" in prompt, "VOH value not formatted in prompt"
+
+    # Without metrics, the section must NOT appear
+    prompt_no_metrics = _build_prompt(COMMON_SOURCE, x, y, info)
+    assert "Key DC Behavioral Metrics" not in prompt_no_metrics, \
+        "Metrics section appears even when metrics=None"
+
+
 # ══════════════════════════════════════════════════════════════════════
 # GROUP B — Feedback loop with mocked AI + ngspice
 # ══════════════════════════════════════════════════════════════════════
@@ -851,6 +1187,45 @@ def run_tests(groups, model=None):
         run("[A] spice_flatten: F Vnam renamed",       a_spice_flatten_f_source_vnam_renamed)
         # spice_flatten: K mutual inductance
         run("[A] spice_flatten: K L-refs renamed",     a_spice_flatten_k_mutual_renamed)
+        # ngspice_runner: .END stripping and manual-compliance fixes
+        run("[A] ngspice: _strip_end_directive removes .END",
+            a_ngspice_strip_end_directive_removes_end)
+        run("[A] ngspice: _strip_end_directive keeps .ENDS",
+            a_ngspice_strip_end_directive_keeps_ends)
+        run("[A] ngspice: deck strips .END before .dc cmd",
+            a_ngspice_deck_strips_end_before_analysis)
+        run("[A] ngspice: AC injection uses token match",
+            a_ngspice_ac_injection_token_match)
+        run("[A] ngspice: AC injection no false positive",
+            a_ngspice_ac_injection_no_false_match)
+        run("[A] ngspice: gm not clobbered by gmb",
+            a_ngspice_gm_not_clobbered_by_gmb)
+        run("[A] ngspice: strategy 3 is DC iteration option",
+            a_ngspice_strategy3_is_dc_iteration)
+        # convergence detection and AC injection fixes
+        run("[A] ngspice: convergence check no false positive",
+            a_ngspice_convergence_check_no_false_positive)
+        run("[A] ngspice: convergence check triggers on failure",
+            a_ngspice_convergence_check_triggers_on_failure)
+        run("[A] ngspice: AC injection skips when 'AC 1' already present",
+            a_ngspice_ac_injection_existing_ac_integer)
+        run("[A] ngspice: AC injection handles I source (§4.2)",
+            a_ngspice_ac_injection_i_source)
+        # tran_sweep deck and output parsing
+        run("[A] ngspice: tran deck has PULSE source",
+            a_tran_deck_has_pulse_source)
+        run("[A] ngspice: tran deck strips .END",
+            a_tran_deck_strips_end)
+        run("[A] ngspice: tran output parsed correctly",
+            a_tran_parse_output)
+        # _extract_dc_metrics
+        run("[A] pipeline: extract_dc_metrics inverter",
+            a_extract_dc_metrics_inverter)
+        run("[A] pipeline: extract_dc_metrics flat sweep",
+            a_extract_dc_metrics_flat)
+        # AI prompt with metrics
+        run("[A] ai_agent: prompt includes metrics section",
+            a_prompt_includes_metrics)
 
     # ── Group B ──────────────────────────────────────────────────────
     if "B" in groups:

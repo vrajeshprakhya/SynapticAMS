@@ -32,7 +32,7 @@ Verilog-AMS rules:
 
 # ── Prompt builders ────────────────────────────────────────────────────
 
-def _build_prompt(netlist, x, y, info):
+def _build_prompt(netlist, x, y, info, metrics=None):
     lines = [
         "Generate a Verilog-AMS behavioral model for the circuit below.",
         "",
@@ -50,6 +50,15 @@ def _build_prompt(netlist, x, y, info):
         idx = np.round(np.linspace(0, len(x) - 1, min(20, len(x)))).astype(int)
         for i in idx:
             lines.append(f"{x[i]:>10.4f}  {y[i]:>10.4f}")
+    if metrics is not None:
+        lines += [
+            "",
+            "## Key DC Behavioral Metrics",
+            f"  VOH  (output-high voltage) = {metrics['voh']:.4f} V",
+            f"  VOL  (output-low  voltage) = {metrics['vol']:.4f} V",
+            f"  Vth  (input threshold)     = {metrics['vth']:.4f} V",
+            f"  Gain (peak |dVout/dVin|)   = {metrics['gain']:.2f} V/V",
+        ]
     lines += [
         "",
         f"Signal input: source={info['signal_source']}, "
@@ -292,11 +301,11 @@ def create_agent(provider=None, model=None):
 
 # ── Public API ─────────────────────────────────────────────────────────
 
-def generate(agent, netlist, x, y, info):
+def generate(agent, netlist, x, y, info, metrics=None):
     """Initial Verilog-AMS generation."""
     name = f"{type(agent).__name__}/{getattr(agent, 'model', '?')}"
     print(f"      [{name}] generating...", end="", flush=True)
-    code = clean_code(agent.chat(SYSTEM_PROMPT, _build_prompt(netlist, x, y, info)))
+    code = clean_code(agent.chat(SYSTEM_PROMPT, _build_prompt(netlist, x, y, info, metrics=metrics)))
     print(" done")
     return code
 
