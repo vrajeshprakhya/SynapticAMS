@@ -266,6 +266,9 @@ def parse_netlist(text):
     dep_sources      = []   # {"out": ...}  — E/G/F/H/B output nodes
     diodes           = []   # {"anode": ..., "cathode": ...}
     dc_sweep_source  = None # source name from .DC directive, if present
+    dc_sweep_start   = None # start value from .DC directive
+    dc_sweep_stop    = None # stop value from .DC directive
+    dc_sweep_step    = None # step value from .DC directive
     subckt_depth     = 0    # >0 means we are inside a .SUBCKT block
     title_seen       = False
 
@@ -302,6 +305,13 @@ def parse_netlist(text):
                     dc_tokens = _normalize_seps(stripped).split()
                     if len(dc_tokens) >= 2:
                         dc_sweep_source = dc_tokens[1]
+                    if len(dc_tokens) >= 5:
+                        try:
+                            dc_sweep_start = _parse_spice_number(dc_tokens[2])
+                            dc_sweep_stop  = _parse_spice_number(dc_tokens[3])
+                            dc_sweep_step  = _parse_spice_number(dc_tokens[4])
+                        except Exception:
+                            pass
 
             elif upper.startswith(".END") and not upper.startswith(".ENDS"):
                 # Per spec sec2: .END marks the absolute end of the netlist.
@@ -448,6 +458,9 @@ def parse_netlist(text):
         "signal_source": signal_source,
         "output_node":   output_node or "vout",
         "vdd":           vdd,
+        "dc_start":      dc_sweep_start,  # None if no .DC directive or not parseable
+        "dc_stop":       dc_sweep_stop,
+        "dc_step":       dc_sweep_step,
     }
 
 
@@ -549,11 +562,16 @@ def run_pipeline(netlist_text, output_dir=".",
     x, y = None, None
     try:
         runner  = NgspiceRunner()
+        # Use .DC parameters from the netlist when present (e.g. differential
+        # circuits with negative start voltage); fall back to 0→vdd/50pts.
+        _dc_start = info["dc_start"] if info["dc_start"] is not None else 0.0
+        _dc_stop  = info["dc_stop"]  if info["dc_stop"]  is not None else info["vdd"]
+        _dc_step  = info["dc_step"]  if info["dc_step"]  is not None else info["vdd"] / 50
         results = runner.dc_sweep(netlist_text, {
-            "sweep_var": info["signal_source"],   # voltage source name for .dc
-            "start":     0.0,
-            "stop":      info["vdd"],
-            "step":      info["vdd"] / 50,        # ~50 data points
+            "sweep_var": info["signal_source"],
+            "start":     _dc_start,
+            "stop":      _dc_stop,
+            "step":      _dc_step,
             "observe":   [info["output_node"]],
         })
         x = results[info["signal_source"]]
@@ -615,7 +633,10 @@ def run_pipeline(netlist_text, output_dir=".",
 # ── Entry point ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    NETLIST = """
+    import sys
+    import tempfile
+
+    _DEFAULT_NETLIST = """
 * Common-source NMOS amplifier
 M1 vout vin 0 0 NMOS W=10u L=1u
 RD vdd vout 10k
@@ -623,10 +644,19 @@ VDD vdd 0 DC 1.8
 Vin vin 0 DC 0
 .model NMOS NMOS (LEVEL=1 VTO=0.4 KP=100u LAMBDA=0.02)
 """
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        va_path, nrmse = run_pipeline(NETLIST, output_dir=tmp)
-        print(f"\n{'=' * 68}")
-        print(" GENERATED VERILOG-AMS:")
-        print("=" * 68)
-        print(va_path.read_text())
+    if len(sys.argv) > 1:
+        netlist_path = Path(sys.argv[1])
+        if not netlist_path.exists():
+            print(f"Error: file not found: {netlist_path}", file=sys.stderr)
+            sys.exit(1)
+        NETLIST = netlist_path.read_text()
+        output_dir = str(netlist_path.parent / (netlist_path.stem + "_output"))
+        va_path, nrmse = run_pipeline(NETLIST, output_dir=output_dir)
+    else:
+        NETLIST = _DEFAULT_NETLIST
+        with tempfile.TemporaryDirectory() as tmp:
+            va_path, nrmse = run_pipeline(NETLIST, output_dir=tmp)
+            print(f"\n{'=' * 68}")
+            print(" GENERATED VERILOG-AMS:")
+            print("=" * 68)
+            print(va_path.read_text())
