@@ -523,6 +523,98 @@ quit
         """
         return self._parse_dc_sweep_output(output, 'time', observe_vars)
 
+    def transient_analysis(self, netlist, tran_params):
+        """
+        Run basic transient analysis (.TRAN) for oscillators and time-domain circuits.
+
+        Unlike tran_sweep(), this method does NOT inject a PULSE source.
+        It simply runs .TRAN with UIC (Use Initial Conditions) to observe
+        the natural time-domain behavior of the circuit (e.g., oscillators).
+
+        Args:
+            netlist: SPICE netlist as string
+            tran_params: Dict with:
+                - tstep:   Time step for output (default: tstop/1000)
+                - tstop:   End time for simulation (required)
+                - tstart:  Start time for saving data (default: 0)
+                - tmax:    Maximum internal timestep (default: tstep)
+                - observe: List of node names to observe
+                - uic:     Use initial conditions (default: False)
+
+        Returns:
+            dict: {'time': np.array, node_name: np.array, ...}
+        """
+        deck = self._build_transient_deck(netlist, tran_params)
+        output = self._execute_ngspice(deck)
+        return self._parse_transient_output(output, tran_params.get('observe', []))
+
+    def _build_transient_deck(self, netlist, tran_params):
+        """
+        Build SPICE deck for basic transient analysis (no source modification).
+
+        Args:
+            netlist: Original SPICE netlist
+            tran_params: Transient parameters dict
+
+        Returns:
+            str: Complete SPICE deck with .control block
+        """
+        # Extract parameters
+        tstop = tran_params['tstop']
+        tstep = tran_params.get('tstep', tstop / 1000.0)
+        tstart = tran_params.get('tstart', 0.0)
+        tmax = tran_params.get('tmax', tstep)
+        observe = tran_params.get('observe', [])
+        uic = tran_params.get('uic', False)
+
+        # Strip .END from netlist
+        netlist_clean = self._strip_end_directive(netlist)
+
+        # Build .TRAN directive
+        # Format: .TRAN tstep tstop <tstart> <tmax> <UIC>
+        tran_directive = f".TRAN {tstep:.12e} {tstop:.12e}"
+        if tstart > 0:
+            tran_directive += f" {tstart:.12e}"
+        if tmax != tstep:
+            tran_directive += f" {tmax:.12e}"
+        if uic:
+            tran_directive += " UIC"
+
+        # Build print statement for observed nodes
+        print_vars = ['time'] + [f'v({node})' for node in observe]
+        print_stmt = 'print ' + ' '.join(print_vars)
+
+        # Assemble deck
+        deck = f"""{netlist_clean}
+
+{tran_directive}
+
+.control
+run
+{print_stmt}
+quit
+.endc
+
+.END
+"""
+        return deck
+
+    def _parse_transient_output(self, output, observe_vars):
+        """
+        Parse transient analysis output.
+
+        Delegates to the same parser used for DC sweep and tran_sweep,
+        since the tabular format is identical.
+
+        Args:
+            output: Raw ngspice output
+            observe_vars: List of node names
+
+        Returns:
+            dict: {'time': np.array, node_name: np.array, ...}
+        """
+        return self._parse_dc_sweep_output(output, 'time', observe_vars)
+
     def ac_sweep(self, netlist, ac_params):
         """
         Run an AC frequency sweep analysis (.AC).

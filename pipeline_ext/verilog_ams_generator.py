@@ -405,6 +405,94 @@ class VerilogAMSGenerator:
 
         return code
 
+    def _generate_oscillator_module(self, module_name, output_name, model, data):
+        """
+        Generate Verilog-AMS for oscillator model
+
+        Oscillators are self-sustaining circuits that generate time-varying
+        signals without external input. Characterized by:
+        - Frequency (Hz)
+        - Amplitude (peak-to-peak volts)
+        - DC offset (volts)
+        - Waveform type (sine, square, triangle)
+
+        Args:
+            module_name: Module name
+            output_name: Output node name
+            model: Model dict with oscillator parameters
+            data: Optional data dict with characterization info
+
+        Returns:
+            str: Verilog-AMS code
+        """
+        output_clean = output_name.replace('net:', '')
+
+        # Extract oscillator parameters
+        frequency = model.get('frequency', 1e6)  # Default: 1 MHz
+        amplitude = model.get('amplitude', 1.0)  # Peak-to-peak amplitude
+        dc_offset = model.get('dc_offset', 0.0)
+        waveform_type = model.get('waveform_type', 'sine')
+
+        # Generate header
+        code = self._generate_header(module_name, model)
+
+        # Module declaration - oscillators have no inputs, only output
+        code += f"module {module_name}(\n"
+        code += f"    output electrical {output_clean}\n"
+        code += ");\n\n"
+
+        # Parameters
+        code += "    // Oscillator parameters\n"
+        code += f"    parameter real frequency = {frequency:.12e};  // Hz\n"
+        code += f"    parameter real amplitude = {amplitude:.12e};  // Peak-to-peak (V)\n"
+        code += f"    parameter real dc_offset = {dc_offset:.12e};  // DC offset (V)\n"
+        code += f"    parameter real pi = 3.14159265358979323846;\n"
+        code += "\n"
+
+        # Analog block
+        code += "    analog begin\n"
+        code += "        real omega, t, signal;\n\n"
+
+        code += "        // Angular frequency (rad/s)\n"
+        code += "        omega = 2.0 * pi * frequency;\n\n"
+
+        code += "        // Current simulation time\n"
+        code += "        t = $abstime;\n\n"
+
+        # Generate waveform based on type
+        if waveform_type == 'sine':
+            code += "        // Sinusoidal oscillation\n"
+            code += "        // signal varies from -amplitude/2 to +amplitude/2\n"
+            code += "        signal = (amplitude / 2.0) * sin(omega * t);\n\n"
+
+        elif waveform_type == 'square':
+            code += "        // Square wave oscillation\n"
+            code += "        // Use tanh for smooth square wave approximation\n"
+            code += "        // (hard square waves can cause convergence issues)\n"
+            code += "        signal = (amplitude / 2.0) * tanh(10.0 * sin(omega * t));\n\n"
+
+        elif waveform_type == 'triangle':
+            code += "        // Triangle wave oscillation\n"
+            code += "        // Approximate using Fourier series (first 3 harmonics)\n"
+            code += "        signal = (amplitude / 2.0) * (\n"
+            code += "            sin(omega * t)\n"
+            code += "            - sin(3.0 * omega * t) / 9.0\n"
+            code += "            + sin(5.0 * omega * t) / 25.0\n"
+            code += "        ) * (8.0 / (pi * pi));\n\n"
+
+        else:  # Default to sine
+            code += "        // Default sinusoidal oscillation\n"
+            code += "        signal = (amplitude / 2.0) * sin(omega * t);\n\n"
+
+        # Apply DC offset
+        code += "        // Apply DC offset and generate output\n"
+        code += f"        V({output_clean}) <+ dc_offset + signal;\n"
+
+        code += "    end\n"
+        code += "endmodule\n"
+
+        return code
+
     def _generate_small_signal_module(self, module_name, fitted_model):
         """
         Generate Verilog-AMS for small-signal linear model

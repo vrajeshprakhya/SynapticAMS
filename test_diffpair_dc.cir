@@ -1,0 +1,38 @@
+* Differential Pair DC Sweep Test
+* From ngspice examples - BJT differential pair with current mirror bias
+* Test: Differential input voltage sweep to observe transfer characteristic
+
+* BJT Models (Gummel-Poon):
+.model qnl npn(bf=80 rb=100 ccs=2pf tf=0.3ns tr=6ns cje=3pf cjc=2pf va=50)
+.model qnr npn(bf=80 rb=100 ccs=2pf tf=0.3ns tr=6ns cje=3pf cjc=2pf va=50)
+
+* Differential Pair Circuit:
+* Q1, Q2: Differential input pair
+* Q3, Q4: Current mirror bias
+q1 vout_p vin_p tail qnr
+q2 vout_n vin_n tail qnl
+rc1 vout_p vcc 10k
+rc2 vout_n vcc 10k
+q3 bias bias vee qnl
+q4 tail bias vee qnr
+rbias bias vcc 20k
+
+* Input Configuration:
+* Common-mode voltage: 0V
+* Differential voltage: swept from -1V to +1V
+vcm common 0 DC 0
+vdm_p common vin_p DC 0
+vdm_n vin_n common DC 0
+
+* Supply Voltages:
+vcc vcc 0 DC 12
+vee vee 0 DC -12
+
+* DC Sweep: Sweep differential input from -1V to +1V
+* vdm_p swept, vdm_n = 0 (fixed at common mode)
+.DC vdm_p -1 1 0.01
+
+* Observe differential output: vout = vout_p - vout_n
+.PRINT DC v(vout_p) v(vout_n) v(vin_p) v(vin_n)
+
+.END
