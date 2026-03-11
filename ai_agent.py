@@ -18,21 +18,33 @@ import numpy as np
 SYSTEM_PROMPT = """\
 You are an expert analog circuit engineer specializing in Verilog-AMS behavioral modeling.
 
-Generate Verilog-AMS (.va) files that accurately replicate a circuit's DC transfer characteristic.
+Generate Verilog-AMS (.va) files that accurately replicate a circuit's transfer characteristic.
 
 Verilog-AMS rules:
-- First line: `include "disciplines.vams"
-- Module ports: (output electrical <out>, input electrical <in>)
+- First line MUST be: `include "disciplines.vams"
+- When using `M_PI or `M_TWO_PI, also add: `include "constants.vams"
+- Module ports: (output electrical out, input electrical in)
 - Use: analog begin ... end
-- Assign output voltage: V(<out>) <+ <expression>;
-- Declare real variables and parameters
+- Assign output voltage: V(out) <+ <expression>;
+- Declare real variables with 'real' and constants with 'parameter real'
 - Model operating regions with if/else (e.g. off, linear, saturation)
-- No markdown fences — return pure .va code only"""
+- No markdown fences — return pure .va code only
+
+When AC frequency response data is provided:
+- Generate a DYNAMIC behavioral model that captures bandwidth, not just DC gain.
+- Use laplace_nd() for a first-order lowpass:
+    V(out) <+ gain * laplace_nd(V(in), {1.0}, {1.0, tau});
+  where tau = 1.0 / (2.0 * `M_TWO_PI * bw_hz) is the RC time constant.
+- Clip the laplace output to saturation with:
+    V(out) <+ min(voh, max(vol, gain * laplace_nd(V(in), {1.0}, {1.0, tau})));
+- The laplace_nd(signal, num_coeffs, den_coeffs) function is built into
+  Verilog-AMS and models an s-domain transfer function H(s)=N(s)/D(s).
+  For H(s) = 1/(1+s*tau): num={1.0}, den={1.0, tau}."""
 
 
 # ── Prompt builders ────────────────────────────────────────────────────
 
-def _build_prompt(netlist, x, y, info, metrics=None):
+def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None):
     lines = [
         "Generate a Verilog-AMS behavioral model for the circuit below.",
         "",
@@ -59,6 +71,38 @@ def _build_prompt(netlist, x, y, info, metrics=None):
             f"  Vth  (input threshold)     = {metrics['vth']:.4f} V",
             f"  Gain (peak |dVout/dVin|)   = {metrics['gain']:.2f} V/V",
         ]
+    if ac_metrics is not None:
+        freqs  = ac_metrics['frequencies']
+        mag_db = ac_metrics['magnitude_db']
+        phases = ac_metrics['phase']
+        lines += [
+            "",
+            "## AC Frequency Response  (small-signal, linearised at DC bias)",
+            f"{'Frequency (Hz)':>16}  {'Gain (dB)':>10}  {'Phase (°)':>10}",
+            "─" * 42,
+        ]
+        idx_ac = np.round(np.linspace(0, len(freqs) - 1,
+                                      min(20, len(freqs)))).astype(int)
+        for i in idx_ac:
+            lines.append(
+                f"{float(freqs[i]):>16.3e}  "
+                f"{float(mag_db[i]):>10.2f}  "
+                f"{float(phases[i]):>10.1f}"
+            )
+        lines += ["",
+                  f"  DC gain  = {ac_metrics['dc_gain_db']:.2f} dB"
+                  f"  ({ac_metrics['dc_gain_linear']:.1f} V/V)"]
+        if ac_metrics['bw_3db_hz']:
+            import math as _math
+            tau = 1.0 / (2.0 * _math.pi * ac_metrics['bw_3db_hz'])
+            lines += [
+                f"  -3dB BW  = {ac_metrics['bw_3db_hz'] / 1e6:.3f} MHz",
+                f"  tau      = {tau * 1e9:.3f} ns  "
+                f"(use as the denominator coefficient in laplace_nd)",
+                "",
+                "Use laplace_nd to model bandwidth in the generated Verilog-AMS:",
+                "  V(out) <+ min(voh, max(vol, gain * laplace_nd(V(in), {1.0}, {1.0, tau})));",
+            ]
     lines += [
         "",
         f"Signal input: source={info['signal_source']}, "
@@ -301,11 +345,14 @@ def create_agent(provider=None, model=None):
 
 # ── Public API ─────────────────────────────────────────────────────────
 
-def generate(agent, netlist, x, y, info, metrics=None):
+def generate(agent, netlist, x, y, info, metrics=None, ac_metrics=None):
     """Initial Verilog-AMS generation."""
     name = f"{type(agent).__name__}/{getattr(agent, 'model', '?')}"
     print(f"      [{name}] generating...", end="", flush=True)
-    code = clean_code(agent.chat(SYSTEM_PROMPT, _build_prompt(netlist, x, y, info, metrics=metrics)))
+    code = clean_code(agent.chat(
+        SYSTEM_PROMPT,
+        _build_prompt(netlist, x, y, info, metrics=metrics, ac_metrics=ac_metrics),
+    ))
     print(" done")
     return code
 

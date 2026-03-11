@@ -5,14 +5,17 @@ SynapticAMS: SPICE netlist → Verilog-AMS behavioral model via AI
 Pipeline:
   1. Parse netlist  → find signal source, output node, supply voltage
   2. Run ngspice    → DC sweep golden-truth I/O data
-  3. AI generates   → Verilog-AMS from netlist + simulation data
-  4. Evaluate       → NRMSE vs SPICE ground truth
-  5. Refine         → feedback loop (up to MAX_ITERATIONS)
-  6. Save           → .va file
+  3. Run ngspice    → AC sweep frequency response
+  4. AI generates   → Verilog-AMS from netlist + simulation data + AC metrics
+  5. Evaluate       → NRMSE vs SPICE ground truth (static models only)
+  6. Refine         → feedback loop (up to MAX_ITERATIONS)
+  7. Save           → .va file + characterization plot
 
 Requires: ngspice on PATH, and one of:
   - ANTHROPIC_API_KEY set  (uses Claude)
   - Ollama running locally (ollama serve && ollama pull qwen2.5-coder:7b)
+
+Optional: matplotlib (pip install matplotlib) for characterization plots.
 """
 
 import re
@@ -526,6 +529,163 @@ def _extract_dc_metrics(x, y, vdd):
     return {'voh': voh, 'vol': vol, 'vth': vth, 'gain': gain}
 
 
+def _get_source_positive_node(netlist_text, device_name):
+    """
+    Given a V or I source device name (e.g. 'Vtx_p'), return the name of its
+    positive terminal node (e.g. 'tx_in_p') by scanning the raw netlist.
+
+    SPICE element syntax (§4.1):  Vxxx N+ N- <DC val> <AC mag> ...
+      tokens[0] = device name, tokens[1] = N+ (positive node).
+
+    This is needed because parse_netlist() returns the DEVICE name for
+    signal_source (to use in .DC commands), but ac_sweep() needs the NODE
+    name to find which source to inject AC into.
+
+    Returns None if the device is not found.
+    """
+    dn_upper = device_name.upper()
+    for line in netlist_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('*'):
+            continue
+        tokens = stripped.split()
+        if tokens[0].upper() == dn_upper and len(tokens) >= 2:
+            return tokens[1]
+    return None
+
+
+def _extract_ac_metrics(ac_results, output_node):
+    """
+    Derive key frequency-domain metrics from an AC sweep result dict.
+
+    Args:
+        ac_results:  dict returned by NgspiceRunner.ac_sweep()
+                     {frequency: np.array, node: {magnitude_db, magnitude, phase}}
+        output_node: the node name whose response to analyse
+
+    Returns:
+        dict with:
+          dc_gain_db     — gain at the lowest swept frequency (≈ DC), in dB
+          dc_gain_linear — same gain in V/V
+          bw_3db_hz      — -3 dB bandwidth in Hz (None if never drops 3 dB)
+          frequencies    — np.array of swept frequencies
+          magnitude_db   — np.array of gain vs frequency in dB
+          phase          — np.array of phase in degrees
+        Returns None if ac_results is empty or output_node is missing.
+    """
+    freqs = ac_results.get('frequency', np.array([]))
+    if output_node not in ac_results or len(freqs) == 0:
+        return None
+    node_data = ac_results[output_node]
+    mag_db = node_data['magnitude_db']
+    phase  = node_data['phase']
+    if len(mag_db) == 0:
+        return None
+
+    dc_gain_db     = float(mag_db[0])
+    dc_gain_linear = 10 ** (dc_gain_db / 20.0)
+    target_db      = dc_gain_db - 3.0
+
+    # Find -3 dB frequency: first point where gain drops below dc_gain - 3 dB.
+    # Log-linear interpolation gives a more accurate crossing than linear.
+    bw_3db = None
+    for i in range(1, len(mag_db)):
+        if float(mag_db[i]) < target_db:
+            f1, f2 = float(freqs[i - 1]), float(freqs[i])
+            m1, m2 = float(mag_db[i - 1]), float(mag_db[i])
+            t = (target_db - m1) / (m2 - m1) if abs(m2 - m1) > 1e-12 else 0.5
+            t = max(0.0, min(1.0, t))
+            bw_3db = f1 * (f2 / f1) ** t
+            break
+
+    return {
+        'dc_gain_db':     dc_gain_db,
+        'dc_gain_linear': dc_gain_linear,
+        'bw_3db_hz':      bw_3db,
+        'frequencies':    freqs,
+        'magnitude_db':   mag_db,
+        'phase':          phase,
+    }
+
+
+def _save_plots(output_dir, x_dc, y_dc, info, ac_metrics):
+    """
+    Save a characterization PNG to output_dir/characterization.png.
+
+    Left panel  — DC transfer characteristic (Vin vs Vout).
+    Right panel — AC Bode magnitude plot (frequency vs gain in dB),
+                  shown only when ac_metrics is not None.
+
+    Requires matplotlib.  Returns the Path if saved, None if matplotlib is
+    unavailable or if the save fails.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')          # non-interactive: no display needed
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    has_ac = (ac_metrics is not None
+              and len(ac_metrics.get('frequencies', [])) > 0)
+
+    fig, axes = plt.subplots(1, 2 if has_ac else 1,
+                             figsize=(12 if has_ac else 6, 4))
+
+    # ── DC panel ─────────────────────────────────────────────────────────
+    ax_dc = axes[0] if has_ac else axes
+    ax_dc.plot(x_dc, y_dc, 'b-', linewidth=1.5)
+    ax_dc.axhline(0, color='k', linewidth=0.4, alpha=0.5)
+    ax_dc.axvline(0, color='k', linewidth=0.4, alpha=0.5)
+    ax_dc.set_xlabel(f"V({info['signal_source']})  [V]")
+    ax_dc.set_ylabel(f"V({info['output_node']})  [V]")
+    ax_dc.set_title('DC Transfer Characteristic')
+    ax_dc.grid(True, alpha=0.3)
+
+    # ── AC Bode panel ────────────────────────────────────────────────────
+    if has_ac:
+        ax_ac = axes[1]
+        freqs  = ac_metrics['frequencies']
+        mag_db = ac_metrics['magnitude_db']
+        ax_ac.semilogx(freqs, mag_db, 'r-', linewidth=1.5)
+        if ac_metrics['bw_3db_hz']:
+            bw = ac_metrics['bw_3db_hz']
+            ax_ac.axvline(bw, color='gray', linestyle='--', linewidth=1,
+                          label=f'−3 dB BW: {bw/1e6:.1f} MHz')
+            ax_ac.axhline(ac_metrics['dc_gain_db'] - 3,
+                          color='gray', linestyle='--', linewidth=1)
+            ax_ac.legend(fontsize=8)
+        ax_ac.set_xlabel('Frequency  [Hz]')
+        ax_ac.set_ylabel('Gain  [dB]')
+        ax_ac.set_title('AC Frequency Response (Bode)')
+        ax_ac.grid(True, which='both', alpha=0.3)
+
+    plt.tight_layout()
+    try:
+        plot_path = Path(output_dir) / 'characterization.png'
+        plt.savefig(str(plot_path), dpi=150, bbox_inches='tight')
+        return plot_path
+    except Exception:
+        return None
+    finally:
+        plt.close()
+
+
+def _is_dynamic_model(va_code):
+    """
+    Return True if va_code uses time-domain or frequency-domain constructs
+    (laplace_nd, laplace_zd, zi_nd, zi_zd, ddt, idt, idtmod).
+
+    Dynamic models cannot be evaluated by the Python-based evaluate_va_code()
+    regex evaluator, so NRMSE validation must be skipped for them.
+    """
+    dynamic_keywords = [
+        'laplace_nd', 'laplace_zd', 'zi_nd', 'zi_zd',
+        'ddt(', 'idt(', 'idtmod(',
+    ]
+    return any(kw in va_code for kw in dynamic_keywords)
+
+
 # ── Main pipeline ──────────────────────────────────────────────────────
 
 def run_pipeline(netlist_text, output_dir=".",
@@ -551,17 +711,17 @@ def run_pipeline(netlist_text, output_dir=".",
     print("=" * 68)
 
     # ── Step 1: Parse ────────────────────────────────────────────────
-    print("\n[1/4] Parsing netlist...")
+    print("\n[1/5] Parsing netlist...")
     info = parse_netlist(netlist_text)
     print(f"      Signal source : {info['signal_source']}")
     print(f"      Output node   : {info['output_node']}")
     print(f"      Supply        : {info['vdd']} V")
 
-    # ── Step 2: Simulate ─────────────────────────────────────────────
-    print("\n[2/4] Running ngspice DC sweep (golden truth)...")
+    # ── Step 2: DC sweep ─────────────────────────────────────────────
+    print("\n[2/5] Running ngspice DC sweep (golden truth)...")
     x, y = None, None
+    runner = NgspiceRunner()
     try:
-        runner  = NgspiceRunner()
         # Use .DC parameters from the netlist when present (e.g. differential
         # circuits with negative start voltage); fall back to 0→vdd/50pts.
         _dc_start = info["dc_start"] if info["dc_start"] is not None else 0.0
@@ -591,33 +751,87 @@ def run_pipeline(netlist_text, output_dir=".",
         print(f"      VOH={metrics['voh']:.3f}V  VOL={metrics['vol']:.3f}V  "
               f"Vth={metrics['vth']:.3f}V  Gain={metrics['gain']:.1f}V/V")
 
-    # ── Step 3: AI generation + feedback loop ────────────────────────
-    print("\n[3/4] AI Agent generating Verilog-AMS...")
+    # ── Step 3: AC sweep ─────────────────────────────────────────────
+    # The AC sweep linearises the circuit around its DC bias point and sweeps
+    # frequency.  This gives us the bandwidth of the SerDes amplifier chain,
+    # which the AI uses to generate a dynamic (first-order laplace) VA model
+    # instead of a purely static V(out)=f(V(in)) expression.
+    print("\n[3/5] Running ngspice AC sweep (frequency response)...")
+    ac_metrics = None
+    try:
+        # ac_sweep needs the POSITIVE TERMINAL NODE of the signal source (e.g.
+        # 'tx_in_p'), not the device name ('Vtx_p') that parse_netlist returns.
+        # _get_source_positive_node extracts tokens[1] from the source line.
+        ac_input_node = _get_source_positive_node(netlist_text,
+                                                   info['signal_source'])
+        if ac_input_node is None:
+            ac_input_node = info['signal_source']   # fallback to device name
+
+        ac_results = runner.ac_sweep(netlist_text, {
+            'sweep_type':   'dec',
+            'n_points':     20,          # 20 pts/decade — enough for Bode plot
+            'start_freq':   1e3,         # 1 kHz  (well below any pole of interest)
+            'stop_freq':    10e9,        # 10 GHz (above any useful SerDes BW)
+            'input_node':   ac_input_node,
+            'output_nodes': [info['output_node']],
+        })
+        ac_metrics = _extract_ac_metrics(ac_results, info['output_node'])
+        if ac_metrics is not None:
+            bw_str = (f"{ac_metrics['bw_3db_hz'] / 1e6:.1f} MHz"
+                      if ac_metrics['bw_3db_hz'] else "N/A (flat across range)")
+            print(f"      DC gain={ac_metrics['dc_gain_db']:.1f} dB  "
+                  f"-3dB BW={bw_str}")
+        else:
+            print("      AC result empty — skipping AC metrics.")
+    except Exception as e:
+        print(f"      AC sweep failed: {e}")
+        print("      Continuing without frequency-domain data.")
+
+    # ── Step 4: AI generation + feedback loop ────────────────────────
+    print("\n[4/5] AI Agent generating Verilog-AMS...")
     agent   = create_agent(provider=provider, model=ai_model)
-    va_code = generate(agent, netlist_text, x, y, info, metrics=metrics)
+    va_code = generate(agent, netlist_text, x, y, info,
+                       metrics=metrics, ac_metrics=ac_metrics)
 
     final_nrmse = None
     if x is not None and y is not None:
-        for i in range(max_iterations):
-            y_model     = evaluate_va_code(va_code, x, info["output_node"])
-            nrmse       = compute_nrmse(y, y_model)
-            final_nrmse = nrmse
-            passed      = nrmse <= nrmse_threshold
-            print(f"      Iter {i + 1}: NRMSE={nrmse:.4f}  {'✓ done' if passed else '— refining'}")
-            if passed:
-                break
-            if i < max_iterations - 1:
-                va_code = refine(agent, netlist_text, x, y, info, va_code, nrmse)
+        if _is_dynamic_model(va_code):
+            # Dynamic models (laplace_nd, ddt, etc.) cannot be evaluated by
+            # the Python regex evaluator in evaluate_va_code().  The model is
+            # saved as-is; a separate Verilog-AMS simulator is needed to
+            # validate it against the SPICE golden data.
+            print("      Dynamic model detected (laplace/ddt) — "
+                  "NRMSE validation skipped.")
+        else:
+            for i in range(max_iterations):
+                y_model     = evaluate_va_code(va_code, x, info["output_node"])
+                nrmse       = compute_nrmse(y, y_model)
+                final_nrmse = nrmse
+                passed      = nrmse <= nrmse_threshold
+                print(f"      Iter {i + 1}: NRMSE={nrmse:.4f}  "
+                      f"{'✓ done' if passed else '— refining'}")
+                if passed:
+                    break
+                if i < max_iterations - 1:
+                    va_code = refine(agent, netlist_text, x, y, info,
+                                     va_code, nrmse)
     else:
         print("      (no simulation data — skipping NRMSE evaluation)")
 
-    # ── Step 4: Save ─────────────────────────────────────────────────
-    print("\n[4/4] Saving...")
+    # ── Step 5: Save ─────────────────────────────────────────────────
+    print("\n[5/5] Saving...")
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     va_path = out / "model.va"
     va_path.write_text(va_code)
-    print(f"      {va_path}")
+    print(f"      model  : {va_path}")
+
+    if x is not None and y is not None:
+        plot_path = _save_plots(output_dir, x, y, info, ac_metrics)
+        if plot_path:
+            print(f"      plots  : {plot_path}")
+        else:
+            print("      plots  : (matplotlib not installed — skipped)")
 
     print(f"\n{'=' * 68}")
     if final_nrmse is not None:
