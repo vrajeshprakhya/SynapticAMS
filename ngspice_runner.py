@@ -704,6 +704,7 @@ quit
 
 .control
 run
+setplot ac1
 print frequency {' '.join(observe_list)}
 quit
 .endc
