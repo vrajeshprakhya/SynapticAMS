@@ -1,0 +1,85 @@
+* CML SerDes Data Path — TX Driver → PCB Channel → RX Amplifier
+* ================================================================
+* A realistic 1.8V NMOS CML (Current Mode Logic) SerDes analog front-end.
+* This is the circuit that SynapticAMS translates to Verilog-AMS.
+*
+* Architecture:
+*   TX CML Driver  — NMOS diff pair, 500µA tail, 800Ω load → ±200mV swing
+*   PCB Channel    — 5cm 50Ω trace model: 5Ω series, 200fF shunt per side
+*   RX CML Amplifier — NMOS diff pair, 500µA tail, 1600Ω load → 800mV swing
+*
+* DC Transfer Characteristic:
+*   Input:  Vtx_p swept 0.60 → 1.20 V, Vtx_n fixed at 0.90 V (common mode)
+*   Output: rx_out_p traces non-inverting S-curve from VOL≈1.0V to VOH≈1.8V
+*   Gain:   ~10 V/V (gm_rx × R_rx = 6.25mA/V × 1600Ω)
+*
+* AC Frequency Response (small-signal at balanced bias):
+*   -3dB BW ≈ 200 MHz  (set by C_rx_p = 500fF and R_rx = 1600Ω)
+*   This models a ~500 Mbps SerDes link
+*
+* Why DC-sweepable (unlike serdes_top.cir):
+*   No VCO or XSPICE elements. Pure SPICE Level-1 MOSFETs.
+*   Single .DC directive sweeps Vtx_p; all nodes converge at each bias point.
+*
+* Compatible with SynapticAMS pipeline:
+*   parse_netlist  → signal_source=Vtx_p, output_node=rx_out_p, vdd=1.8
+*   dc_sweep       → 200 points, S-curve from ~1.0V to ~1.8V
+*   ac_sweep       → DC gain ≈ 20 dB, -3dB BW ≈ 200 MHz
+*   AI generation  → laplace_nd model with correct gain and tau
+* ================================================================
+
+* ── MOSFET Model (Level 1, 180nm-class generic CMOS) ─────────────────
+* VTO=0.45V, KP=200µA/V² (NMOS), modest velocity saturation via LAMBDA
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.45 KP=200u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+
+* ── Power Supply ────────────────────────────────────────────────────────
+VDD  vdd  0  DC 1.8
+
+* ── TX Input ─────────────────────────────────────────────────────────────
+* Vtx_n fixed at 0.90V common mode; Vtx_p is swept by .DC
+* Differential input Vdiff = Vtx_p - Vtx_n sweeps ±0.30V around 0V
+Vtx_p  tx_in_p  0  DC 0.9
+Vtx_n  tx_in_n  0  DC 0.9
+
+* ── RX Differential Amplifier ─────────────────────────────────────────
+* Listed first so parse_netlist (after flattening) picks rx_out_p as
+* the output node. This is the same ordering trick used in serdes_dc.cir.
+*
+* W=20µm, L=0.18µm → W/L=111 → gm≈6.25mA/V at 250µA
+* R_rx = 1600Ω → voltage gain = gm × R_rx ≈ 10 V/V
+* C_rx = 500fF → -3dB BW = 1/(2π × 1600 × 500fF) ≈ 199 MHz
+M_rx_p  rx_out_p  rx_in_p  rx_tail  0  NMOS  W=20u  L=0.18u
+M_rx_n  rx_out_n  rx_in_n  rx_tail  0  NMOS  W=20u  L=0.18u
+R_rx_p  vdd  rx_out_p  1600
+R_rx_n  vdd  rx_out_n  1600
+I_rx    rx_tail  0   DC  500u
+C_rx_p  rx_out_p  0  500f
+C_rx_n  rx_out_n  0  500f
+
+* ── PCB Channel (5cm 50Ω trace) ──────────────────────────────────────
+* Series R = 5Ω (trace + contact resistance)
+* Shunt C = 200fF (trace capacitance ≈ 40fF/cm × 5cm)
+* RC pole ≈ 1/(2π × 5 × 200fF) ≈ 159 GHz — not bandwidth-limiting
+R_ch_p  tx_out_p  rx_in_p  5
+R_ch_n  tx_out_n  rx_in_n  5
+C_ch_p  rx_in_p   0  200f
+C_ch_n  rx_in_n   0  200f
+
+* ── TX Differential Driver ────────────────────────────────────────────
+* W=10µm, L=0.18µm → W/L=55.6 → gm≈3.1mA/V at 250µA
+* R_tx = 800Ω → TX output swing = I_tail × R_tx = 500µA × 800Ω = 400mV diff
+M_tx_p  tx_out_p  tx_in_p  tx_tail  0  NMOS  W=10u  L=0.18u
+M_tx_n  tx_out_n  tx_in_n  tx_tail  0  NMOS  W=10u  L=0.18u
+R_tx_p  vdd  tx_out_p  800
+R_tx_n  vdd  tx_out_n  800
+I_tx    tx_tail  0   DC  500u
+
+* ── DC Sweep ────────────────────────────────────────────────────────────
+* Sweep TX positive input from 0.60V to 1.20V in 3mV steps (200 points)
+* Vtx_n = 0.90V fixed → differential input Vdiff = Vtx_p - 0.9 ∈ [-0.3, +0.3]V
+* Output rx_out_p: S-curve from VOL≈1.0V (Vtx_p low) to VOH≈1.8V (Vtx_p high)
+.DC Vtx_p 0.60 1.20 0.003
+
+.PRINT DC v(rx_out_p) v(rx_out_n) v(tx_out_p) v(tx_out_n)
+
+.END

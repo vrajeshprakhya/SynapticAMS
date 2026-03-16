@@ -32,13 +32,16 @@ Verilog-AMS rules:
 
 When AC frequency response data is provided:
 - Generate a DYNAMIC behavioral model that captures bandwidth, not just DC gain.
-- Use laplace_nd() for a first-order lowpass:
-    V(out) <+ gain * laplace_nd(V(in), {1.0}, {1.0, tau});
-  where tau = 1.0 / (2.0 * `M_TWO_PI * bw_hz) is the RC time constant.
-- Clip the laplace output to saturation with:
-    V(out) <+ min(voh, max(vol, gain * laplace_nd(V(in), {1.0}, {1.0, tau})));
-- The laplace_nd(signal, num_coeffs, den_coeffs) function is built into
-  Verilog-AMS and models an s-domain transfer function H(s)=N(s)/D(s).
+- Use laplace_nd() for a first-order lowpass with input bias offset:
+    parameter real vmid = (voh + vol) / 2.0;   // output midpoint
+    V(out) <+ min(voh, max(vol, vmid + gain * laplace_nd(V(in) - vth, {1.0}, {1.0, tau})));
+  where:
+    vth  = input threshold voltage (midpoint of S-curve, from Vth metric)
+    vmid = (voh + vol) / 2.0  (output midpoint)
+    tau  = 1.0 / (2.0 * `M_PI * 2.0 * bw_hz)  (RC time constant)
+- The bias offset V(in) - vth centres the linear amplification on the correct
+  operating point. Without it, gain * V(in) saturates for all biased circuits.
+- The laplace_nd(signal, num_coeffs, den_coeffs) function models H(s)=N(s)/D(s).
   For H(s) = 1/(1+s*tau): num={1.0}, den={1.0, tau}."""
 
 
@@ -100,8 +103,10 @@ def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None):
                 f"  tau      = {tau * 1e9:.3f} ns  "
                 f"(use as the denominator coefficient in laplace_nd)",
                 "",
-                "Use laplace_nd to model bandwidth in the generated Verilog-AMS:",
-                "  V(out) <+ min(voh, max(vol, gain * laplace_nd(V(in), {1.0}, {1.0, tau})));",
+                "Use laplace_nd with input bias offset (vth from metrics above):",
+                "  parameter real vmid = (voh + vol) / 2.0;",
+                "  V(out) <+ min(voh, max(vol, vmid + gain * laplace_nd(V(in) - vth, {1.0}, {1.0, tau})));",
+                "  // V(in) - vth centres amplification on the operating point",
             ]
     lines += [
         "",
@@ -169,17 +174,65 @@ def evaluate_va_code(va_code, x, output_node):
     """
     y = np.full(len(x), np.nan)
 
-    # Extract `parameter real name = value;`
+    # Extract `parameter real name = value;` — two passes so expressions
+    # like `parameter real vmid = (voh + vol) / 2.0;` work after voh/vol
+    # are already known.
     params = {}
+    param_exprs = {}   # name → raw expression string, for second pass
     for m in re.finditer(r"parameter\s+real\s+(\w+)\s*=\s*([^;,\n]+)", va_code):
+        name, expr_str = m.group(1), m.group(2).strip()
         try:
-            params[m.group(1)] = float(m.group(2).strip())
+            params[name] = float(expr_str)
         except ValueError:
-            pass
+            param_exprs[name] = expr_str   # deferred — needs other params
+
+    # Second pass: evaluate deferred parameter expressions with known params
+    def _try_eval_expr(expr_str, known):
+        e = expr_str
+        for pname, pval in known.items():
+            e = re.sub(r'\b' + re.escape(pname) + r'\b', str(pval), e)
+        try:
+            return float(eval(e, {"__builtins__": {}}))  # noqa: S307
+        except Exception:
+            return None
+
+    for name, expr_str in param_exprs.items():
+        v = _try_eval_expr(expr_str, params)
+        if v is not None:
+            params[name] = v
+
+    # Also extract analog/initial-block variable assignments: `name = expr;`
+    for m in re.finditer(r"^\s*(\w+)\s*=\s*([^;]+);", va_code, re.M):
+        name, expr_str = m.group(1), m.group(2).strip()
+        if name in params:
+            continue   # parameter real takes precedence
+        v = _try_eval_expr(expr_str, params)
+        if v is not None:
+            params[name] = v
+
+    # Extract input port names so bare references (e.g. `in`) can be
+    # mapped to x_val in addition to the V(port) form.
+    input_ports = re.findall(
+        r"(?:input|inout)\s+electrical\s+(\w+)", va_code
+    )
 
     def _to_py(expr):
         """Translate a Verilog-AMS expression to a Python-evaluable string."""
+        # DC substitution for laplace_nd: at s=0, H(s) = num[0]/den[0] = 1/1 = 1
+        # so laplace_nd(signal, {1.0}, {1.0, tau}) → signal.
+        # This lets evaluate_va_code compute a meaningful DC NRMSE for dynamic models.
+        # DC substitution for laplace_nd: replace with inner signal wrapped in parens.
+        # Pattern includes the closing ')' so nothing is left dangling.
+        # gain * laplace_nd(V(in) - vth, {1.0}, {1.0, tau}) → gain * (V(in) - vth)
+        expr = re.sub(
+            r"laplace_nd\s*\(([^,]+),\s*\{[^}]+\},\s*\{[^}]+\}\s*\)",
+            r"(\1)", expr,
+        )
         expr = re.sub(r"\bV\s*\([^)]+\)", "x_val", expr)
+        # Also replace bare port names (e.g. `in` without V()) → x_val.
+        # LLMs sometimes write laplace_nd(in - vth, ...) omitting V().
+        for port in input_ports:
+            expr = re.sub(r"\b" + re.escape(port) + r"\b", "x_val", expr)
         expr = re.sub(r"\btanh\b",    "np.tanh",    expr)
         expr = re.sub(r"\bexp\b",     "np.exp",     expr)
         expr = re.sub(r"\bsqrt\b",    "np.sqrt",    expr)
@@ -238,9 +291,22 @@ def evaluate_va_code(va_code, x, output_node):
 
 
 def clean_code(text):
-    """Strip markdown fences that LLMs sometimes wrap responses in."""
+    """Strip markdown fences and fix common Ollama Verilog-AMS syntax errors."""
     text = re.sub(r"```(?:verilog(?:-ams)?|vams)?\n?", "", text, flags=re.I)
-    return text.strip()
+    text = text.strip()
+    # Fix missing backtick before `include (e.g. include "disciplines.vams")
+    text = re.sub(r'^(\s*)include\s+"', r'\1`include "', text, flags=re.M)
+    # Fix module declaration missing semicolon (e.g. module foo(out, in)\n)
+    text = re.sub(r'(module\s+\w+\s*\([^)]*\))\s*\n', r'\1;\n', text)
+    # Fix module-level `real name = val;` → `parameter real name = val;`
+    # Only apply before `analog begin` block
+    analog_idx = text.find('analog begin')
+    if analog_idx > 0:
+        pre = text[:analog_idx]
+        post = text[analog_idx:]
+        pre = re.sub(r'^(\s*)real\s+(\w+)\s*=\s*', r'\1parameter real \2 = ', pre, flags=re.M)
+        text = pre + post
+    return text
 
 
 # ── Ollama backend ─────────────────────────────────────────────────────

@@ -496,8 +496,10 @@ def _extract_dc_metrics(x, y, vdd):
     Returns:
         dict: {'voh': float, 'vol': float, 'vth': float, 'gain': float}
     """
-    voh      = float(y[0])
-    vol      = float(y[-1])
+    # VOH = high output state, VOL = low output state — always VOH > VOL.
+    # y[0]/y[-1] swap for non-inverting circuits (where output rises with input).
+    voh      = float(max(y[0], y[-1]))
+    vol      = float(min(y[0], y[-1]))
     midpoint = (voh + vol) / 2.0
 
     # Switching threshold: first crossing of (VOH+VOL)/2 by linear interp

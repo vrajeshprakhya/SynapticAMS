@@ -253,8 +253,9 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
                 print(f" ⚠ No transistors found, skipping")
                 continue
 
-            # Extract AC parameters
-            ac_params = runner.extract_ac_params(netlist_text, transistor_devices)
+            # Extract AC parameters (must use flat_netlist — subcircuit BJTs
+            # are only visible as individual devices after flattening)
+            ac_params = runner.extract_ac_params(flat_netlist, transistor_devices)
             print(f" ✓ {len(transistor_devices)} devices")
 
             small_signal_results.append({
@@ -538,9 +539,10 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
                 # around a DC operating point. They can't be validated standalone
                 # with DC sweeps - they need to be embedded in a complete circuit.
                 # Instead, we validate the extracted parameters (gm, gds).
-                ac_params = fitted_model.get('model', {})
-                gm = ac_params.get('gm', 0)
-                gds = ac_params.get('gds', 0)
+                model_data = fitted_model.get('model', {})
+                params = model_data.get('parameters', model_data)
+                gm = params.get('gm', 0)
+                gds = params.get('gds', 0)
                 print(f"      ○ {module_name}: small-signal model " +
                       f"(gm={gm:.2e} S, gds={gds:.2e} S) - parameter validation only")
             else:

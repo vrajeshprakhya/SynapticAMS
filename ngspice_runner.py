@@ -1098,6 +1098,17 @@ quit
                                 results[param] = float(tokens[1])
                             except ValueError:
                                 pass
+                # BJTs use 'go' (output conductance) instead of 'gds'.
+                # Map 'go' → 'gds' so downstream VA generators always see 'gds'.
+                if (line_stripped == 'go'
+                        or line_stripped.startswith('go ')
+                        or line_stripped.startswith('go\t')):
+                    tokens = line_stripped.split()
+                    if len(tokens) >= 2:
+                        try:
+                            results['gds'] = float(tokens[1])
+                        except ValueError:
+                            pass
 
         return results
 

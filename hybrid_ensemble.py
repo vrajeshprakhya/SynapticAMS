@@ -26,7 +26,7 @@ import tempfile
 import numpy as np
 
 # Import both pipelines
-from pipeline import run_pipeline as ai_pipeline
+from pipeline import run_pipeline as ai_pipeline, parse_netlist
 from ngspice_runner import NgspiceRunner, NgspiceError
 from ai_agent import compute_nrmse, evaluate_va_code
 
@@ -77,16 +77,20 @@ def _run_test_dc_sweep(netlist: str, signal_source: str, vdd: float, output_node
     """
     Run a test DC sweep for validation (separate from training data).
 
-    Uses a slightly different sweep range to ensure independent validation.
+    Uses the netlist's own DC range (dc_start/dc_stop/dc_step from parse_netlist)
+    so differential/AC-coupled circuits with non-zero sweep start work correctly.
     """
     runner = NgspiceRunner()
     try:
-        # Use 30 points instead of 50 (different from AI pipeline default)
+        info = parse_netlist(netlist)
+        _dc_start = info["dc_start"] if info.get("dc_start") is not None else 0.0
+        _dc_stop  = info["dc_stop"]  if info.get("dc_stop")  is not None else vdd
+        _dc_step  = info["dc_step"]  if info.get("dc_step")  is not None else vdd / 30
         results = runner.dc_sweep(netlist, {
             "sweep_var": signal_source,
-            "start": 0.0,
-            "stop": vdd,
-            "step": vdd / 30,
+            "start": _dc_start,
+            "stop":  _dc_stop,
+            "step":  _dc_step,
             "observe": [output_node],
         })
         x = results[signal_source]
@@ -186,6 +190,8 @@ def _evaluate_model_on_test_sweep(va_path: Path, x_test: np.ndarray,
 
     try:
         va_code = va_path.read_text()
+        # evaluate_va_code handles laplace_nd via DC substitution (H(0)=1),
+        # so dynamic models can now be evaluated alongside static ones.
         y_model = evaluate_va_code(va_code, x_test, output_node)
         nrmse = compute_nrmse(y_test, y_model)
         return nrmse
