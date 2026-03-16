@@ -710,6 +710,200 @@ def _eval_2d_model(X1, X2, model):
 
 
 # ============================================================
+# Transient Waveform Analysis
+# ============================================================
+
+def analyze_oscillator_waveform(time, voltage):
+    """
+    Analyze a transient waveform to extract oscillator characteristics.
+
+    Args:
+        time: 1D array of time points (seconds)
+        voltage: 1D array of voltage samples
+
+    Returns:
+        dict: {
+            'frequency': float (Hz),
+            'amplitude': float (V),
+            'offset': float (V),
+            'period': float (s),
+            'duty_cycle': float (0-1),
+            'is_oscillating': bool,
+            'quality': float (0-1, measure of waveform quality)
+        }
+    """
+    if len(time) < 10 or len(voltage) < 10:
+        return {
+            'is_oscillating': False,
+            'frequency': 0.0,
+            'amplitude': 0.0,
+            'offset': np.mean(voltage),
+            'period': 0.0,
+            'duty_cycle': 0.5,
+            'quality': 0.0
+        }
+
+    # Remove DC offset
+    offset = np.mean(voltage)
+    v_ac = voltage - offset
+
+    # Check if signal is actually oscillating (non-constant)
+    if np.std(v_ac) < 1e-6:
+        return {
+            'is_oscillating': False,
+            'frequency': 0.0,
+            'amplitude': 0.0,
+            'offset': offset,
+            'period': 0.0,
+            'duty_cycle': 0.5,
+            'quality': 0.0
+        }
+
+    # Detect zero crossings to find period
+    zero_crossings = np.where(np.diff(np.sign(v_ac)))[0]
+
+    if len(zero_crossings) < 2:
+        # Not enough crossings - not oscillating
+        return {
+            'is_oscillating': False,
+            'frequency': 0.0,
+            'amplitude': np.ptp(voltage) / 2,
+            'offset': offset,
+            'period': 0.0,
+            'duty_cycle': 0.5,
+            'quality': 0.0
+        }
+
+    # Calculate periods from consecutive zero crossings (half periods)
+    half_periods = np.diff(time[zero_crossings])
+
+    # Full period is 2x half-period
+    # Handle odd number of half-periods by truncating to even length
+    n_pairs = len(half_periods) // 2
+    if n_pairs > 0:
+        periods = half_periods[:n_pairs*2:2] + half_periods[1:n_pairs*2:2]
+    else:
+        periods = half_periods * 2
+
+    if len(periods) == 0:
+        periods = half_periods * 2
+
+    # Use median period (robust to outliers)
+    period = np.median(periods)
+    frequency = 1.0 / period if period > 0 else 0.0
+
+    # Measure amplitude (peak-to-peak / 2)
+    amplitude = np.ptp(v_ac) / 2
+
+    # Estimate duty cycle from positive vs negative time
+    positive_time = np.sum(v_ac > 0) * (time[1] - time[0])
+    total_time = time[-1] - time[0]
+    duty_cycle = positive_time / total_time if total_time > 0 else 0.5
+
+    # Quality metric: coefficient of variation of periods
+    # Lower variation = better quality oscillation
+    period_std = np.std(periods)
+    period_mean = np.mean(periods)
+    cv = period_std / period_mean if period_mean > 0 else 1.0
+    quality = max(0.0, 1.0 - cv)  # 1.0 = perfect, 0.0 = chaotic
+
+    return {
+        'is_oscillating': True,
+        'frequency': frequency,
+        'amplitude': amplitude,
+        'offset': offset,
+        'period': period,
+        'duty_cycle': duty_cycle,
+        'quality': quality,
+        'num_cycles': len(periods)
+    }
+
+
+def fit_oscillator_model(time, voltage):
+    """
+    Fit an oscillator model from transient waveform data.
+
+    Args:
+        time: 1D array of time points
+        voltage: 1D array of voltage samples
+
+    Returns:
+        dict: Model parameters suitable for Verilog-AMS generation
+    """
+    # Analyze waveform
+    analysis = analyze_oscillator_waveform(time, voltage)
+
+    if not analysis['is_oscillating']:
+        # Not an oscillator - return constant model
+        return {
+            'model_type': 'constant',
+            'intent': 'dc',
+            'params': {
+                'value': analysis['offset']
+            }
+        }
+
+    # Determine waveform shape
+    waveform_type = _classify_waveform_shape(time, voltage, analysis)
+
+    return {
+        'model_type': 'oscillator',
+        'intent': 'dynamic',
+        'waveform': waveform_type,
+        'params': {
+            'frequency': analysis['frequency'],
+            'amplitude': analysis['amplitude'],
+            'offset': analysis['offset'],
+            'duty_cycle': analysis['duty_cycle'],
+            'period': analysis['period']
+        },
+        'quality': analysis['quality'],
+        'num_cycles': analysis.get('num_cycles', 0)
+    }
+
+
+def _classify_waveform_shape(time, voltage, analysis):
+    """
+    Classify the shape of an oscillating waveform.
+
+    Returns:
+        str: 'sine', 'square', 'triangle', or 'complex'
+    """
+    # Normalize waveform
+    v_norm = (voltage - analysis['offset']) / (analysis['amplitude'] + 1e-12)
+
+    # Test 1: Square wave (sharp transitions, mostly at +1 or -1)
+    near_extremes = np.sum(np.abs(v_norm) > 0.8) / len(v_norm)
+    if near_extremes > 0.7:
+        return 'square'
+
+    # Test 2: Sine wave (smooth, single frequency FFT)
+    try:
+        from scipy import fft
+        spectrum = np.abs(fft.fft(v_norm))
+        fundamental_idx = np.argmax(spectrum[1:len(spectrum)//2]) + 1
+        fundamental_power = spectrum[fundamental_idx]
+        total_power = np.sum(spectrum[1:len(spectrum)//2])
+
+        # If >90% power in fundamental, it's sinusoidal
+        if fundamental_power / total_power > 0.9:
+            return 'sine'
+    except:
+        pass
+
+    # Test 3: Triangle (linear ramp, derivative mostly constant)
+    dv = np.diff(v_norm)
+    dv_variance = np.std(np.abs(dv))
+    dv_mean = np.mean(np.abs(dv))
+
+    if dv_variance / (dv_mean + 1e-12) < 0.3:
+        return 'triangle'
+
+    # Default: complex waveform
+    return 'complex'
+
+
+# ============================================================
 # Example
 # ============================================================
 

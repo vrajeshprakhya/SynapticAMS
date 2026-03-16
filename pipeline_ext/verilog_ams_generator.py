@@ -77,6 +77,10 @@ class VerilogAMSGenerator:
             code = self._generate_linear_ac_module(
                 module_name, input_name, output_name, model, fitted_model['data']
             )
+        elif model['model_type'] == 'oscillator':
+            code = self._generate_oscillator_module(
+                module_name, output_name, model, fitted_model['data']
+            )
         else:
             raise ValueError(f"Unknown model type: {model['model_type']}")
 
@@ -129,7 +133,7 @@ class VerilogAMSGenerator:
         code += "\n"
 
         # Analog block
-        code += "    analog begin\n"
+        code += "    analog begin : analog_block\n"
 
         if smoothing.get('type') == 'tanh_blend':
             code += self._generate_tanh_blended_code(
@@ -286,7 +290,7 @@ class VerilogAMSGenerator:
         code += f"    parameter integer n_points = {len(x)};\n"
         code += "\n"
 
-        code += "    analog begin\n"
+        code += "    analog begin : analog_block\n"
         code += "        real y_out;\n\n"
 
         code += "        // Linear interpolation lookup table\n"
@@ -397,7 +401,7 @@ class VerilogAMSGenerator:
 
         # For now, generate simple resistive divider / linear gain
         # TODO: Could add pole/zero fitting here for more accurate frequency response
-        code += "    analog begin\n"
+        code += "    analog begin : analog_block\n"
         code += f"        // Linear DC transfer: {output_clean} = dc_gain * {input_clean}\n"
         code += f"        V({output_clean}) <+ dc_gain * V({input_clean});\n"
         code += "    end\n"
@@ -450,7 +454,7 @@ class VerilogAMSGenerator:
         code += "\n"
 
         # Analog block
-        code += "    analog begin\n"
+        code += "    analog begin : analog_block\n"
         code += "        real omega, t, signal;\n\n"
 
         code += "        // Angular frequency (rad/s)\n"
@@ -532,7 +536,7 @@ class VerilogAMSGenerator:
         code += "\n"
 
         # Analog block
-        code += "    analog begin\n"
+        code += "    analog begin : analog_block\n"
 
         # Generate small-signal equations
         # Standard MOSFET small-signal: id = gm*vgs + gds*vds + gmb*vbs
@@ -560,6 +564,87 @@ class VerilogAMSGenerator:
 
         return code
 
+    def _generate_oscillator_module(self, module_name, output_name, model, data):
+        """
+        Generate Verilog-AMS for oscillator model
+
+        Args:
+            module_name: Module name
+            output_name: Output signal name
+            model: Model dict with oscillator parameters
+            data: Transient waveform data
+
+        Returns:
+            str: Verilog-AMS code
+        """
+        params = model.get('params', {})
+        waveform = model.get('waveform', 'sine')
+
+        frequency = params.get('frequency', 1e9)
+        amplitude = params.get('amplitude', 1.0)
+        offset = params.get('offset', 0.0)
+        duty_cycle = params.get('duty_cycle', 0.5)
+
+        output_clean = output_name.replace('net:', '')
+
+        # Generate header
+        code = self._generate_header(module_name, model)
+
+        # Module declaration
+        code += f"module {module_name}(\n"
+        code += f"    output electrical {output_clean}\n"
+        code += ");\n\n"
+
+        # Parameters
+        code += "    // Oscillator parameters (extracted from transient simulation)\n"
+        code += f"    parameter real frequency = {frequency:.12e};  // Hz\n"
+        code += f"    parameter real amplitude = {amplitude:.12e};  // V\n"
+        code += f"    parameter real offset = {offset:.12e};        // V\n"
+
+        if waveform == 'square':
+            code += f"    parameter real duty_cycle = {duty_cycle:.6f};  // 0-1\n"
+
+        code += "\n"
+
+        # Analog block
+        code += "    analog begin : analog_block\n"
+        code += "        real omega, phase, output_val;\n\n"
+
+        code += "        // Angular frequency\n"
+        code += "        omega = 2.0 * `M_PI * frequency;\n\n"
+
+        code += "        // Phase (accumulated from time)\n"
+        code += "        phase = omega * $abstime;\n\n"
+
+        code += "        // Generate waveform\n"
+
+        if waveform == 'sine':
+            code += "        output_val = offset + amplitude * sin(phase);\n\n"
+
+        elif waveform == 'square':
+            code += "        // Square wave using transition function for smoothness\n"
+            code += "        if (phase - floor(phase/(2*`M_PI))*(2*`M_PI) < 2*`M_PI*duty_cycle)\n"
+            code += "            output_val = offset + amplitude;\n"
+            code += "        else\n"
+            code += "            output_val = offset - amplitude;\n\n"
+
+        elif waveform == 'triangle':
+            code += "        // Triangle wave\n"
+            code += "        output_val = offset + (4*amplitude/`M_PI) * asin(sin(phase));\n\n"
+
+        else:  # complex or unknown
+            # Default to sine wave
+            code += "        // Complex waveform approximated as sine\n"
+            code += "        output_val = offset + amplitude * sin(phase);\n\n"
+
+        code += "        // Drive output\n"
+        code += f"        V({output_clean}) <+ output_val;\n"
+
+        code += "    end\n"
+        code += "endmodule\n"
+
+        return code
+
     def _generate_header(self, module_name, model):
         """
         Generate file header with metadata
@@ -575,6 +660,9 @@ class VerilogAMSGenerator:
 
         if model['model_type'] == 'analytic':
             header += f"// Fit quality (NRMSE): {model.get('nrmse', 'N/A')}\n"
+        elif model['model_type'] == 'oscillator':
+            header += f"// Oscillator frequency: {model.get('params', {}).get('frequency', 'N/A')} Hz\n"
+            header += f"// Waveform type: {model.get('waveform', 'unknown')}\n"
 
         header += "\n`include \"disciplines.vams\"\n\n"
 
@@ -644,7 +732,7 @@ class VerilogAMSGenerator:
         code += ");\n\n"
 
         # Generate equation based on model type
-        code += "    analog begin\n"
+        code += "    analog begin : analog_block\n"
 
         if model_type == 'differential':
             a = params['a']
@@ -715,7 +803,7 @@ class VerilogAMSGenerator:
         code += f"    parameter integer n2 = {len(x2)};\n"
         code += "\n"
 
-        code += "    analog begin\n"
+        code += "    analog begin : analog_block\n"
         code += "        // 2D bilinear interpolation\n"
         code += "        // Note: This is a placeholder - full 2D LUT implementation\n"
         code += "        // would require $table_model or custom interpolation logic\n"

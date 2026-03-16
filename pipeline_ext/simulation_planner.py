@@ -430,6 +430,119 @@ class SimulationPlanner:
             'observe': observe_vars
         }
 
+    def plan_transient(self, block):
+        """
+        Generate transient analysis parameters for oscillators and dynamic circuits.
+
+        Args:
+            block: Block dict from pipeline_ext.circuit_analyzer with:
+                   - simulation_axes: set of control nets (if any)
+                   - outputs: set of output nets
+                   - behavior_class: str classification
+                   - name: block name (used for oscillator detection)
+
+        Returns:
+            dict: Transient simulation parameters or None if not applicable
+        """
+        outputs = block.get('outputs', set())
+        block_name = block.get('name', '').lower()
+
+        if not outputs:
+            return None
+
+        # Detect if this is an oscillator/VCO circuit
+        is_oscillator = self._is_oscillator_block(block)
+
+        if not is_oscillator:
+            return None
+
+        # Determine simulation parameters based on expected frequency
+        expected_freq = self._estimate_oscillator_frequency(block)
+
+        # Run for at least 10 cycles to capture steady-state
+        period = 1.0 / expected_freq if expected_freq > 0 else 1e-6
+        tstop = 10 * period
+        tstep = period / 100  # 100 points per cycle
+
+        # Convert output nets to node names
+        observe_vars = [n.replace("net:", "") for n in outputs]
+
+        return {
+            'type': 'transient',
+            'tstop': tstop,
+            'tstep': tstep,
+            'tstart': 5 * period,  # Skip first 5 cycles for settling
+            'observe': observe_vars,
+            'uic': True,  # Use initial conditions for oscillators
+            'expected_freq': expected_freq
+        }
+
+    def _is_oscillator_block(self, block):
+        """
+        Detect if a block is likely an oscillator or VCO.
+
+        Args:
+            block: Block dict with name, devices, topology info
+
+        Returns:
+            bool: True if likely oscillator
+        """
+        block_name = block.get('name', '').lower()
+
+        # Name-based detection (most reliable)
+        oscillator_keywords = ['osc', 'vco', 'ring', 'pll', 'clock', 'clk']
+        if any(keyword in block_name for keyword in oscillator_keywords):
+            return True
+
+        # Topology-based detection: ring oscillators have odd number of inverters
+        # (This would require more sophisticated graph analysis)
+
+        # No control inputs (simulation_axes) is a strong indicator
+        # Oscillators are autonomous - they don't need external signals to run
+        simulation_axes = block.get('simulation_axes', set())
+        has_signal_inputs = len([ax for ax in simulation_axes
+                                if ax.replace("net:", "").lower() not in
+                                ['vdd', 'vcc', 'vss', 'gnd', '0']]) > 0
+
+        # If no signal inputs and has outputs, might be oscillator
+        outputs = block.get('outputs', set())
+        if not has_signal_inputs and len(outputs) > 0:
+            # Additional heuristic: oscillators often have feedback
+            # (would need more graph analysis to detect)
+            return True
+
+        return False
+
+    def _estimate_oscillator_frequency(self, block):
+        """
+        Estimate the oscillation frequency of a circuit.
+
+        Args:
+            block: Block dict
+
+        Returns:
+            float: Estimated frequency in Hz (default 1GHz if unknown)
+        """
+        block_name = block.get('name', '').lower()
+
+        # Try to extract frequency from name (e.g., "vco_1ghz")
+        import re
+        freq_patterns = [
+            (r'(\d+\.?\d*)\s*ghz', 1e9),
+            (r'(\d+\.?\d*)\s*mhz', 1e6),
+            (r'(\d+\.?\d*)\s*khz', 1e3),
+        ]
+
+        for pattern, multiplier in freq_patterns:
+            match = re.search(pattern, block_name, re.IGNORECASE)
+            if match:
+                freq_value = float(match.group(1))
+                return freq_value * multiplier
+
+        # Default: assume 1 GHz for high-speed circuits
+        # (Conservative - leads to short simulation time)
+        return 1e9
+
 
 # Example usage
 if __name__ == "__main__":

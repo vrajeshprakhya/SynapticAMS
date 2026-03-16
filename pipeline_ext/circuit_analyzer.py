@@ -182,12 +182,15 @@ def find_signal_source_nets(graph):
 
     Strategy:
     1. First try to find AC/transient sources (for AC/small-signal analysis)
-    2. If none found, use DC source heuristic (for DC sweep analysis):
-       - Prefer current sources with lowest |DC| value
-       - Otherwise voltage sources with lowest DC value
-       - Exclude supply rails (highest voltage sources)
+    2. If none found, use NAME-BASED detection (for complex circuits):
+       - Detect sources by name patterns (vin, data, sig, ctrl, cont, input)
+       - Exclude supply rail patterns (vdd, vcc, vss, vee, supply, rail)
+    3. If name-based fails, fall back to DC value heuristic:
+       - Prefer current sources (less common, likely signals)
+       - For voltage sources, exclude extreme values (likely supplies)
+       - Take sources with small DC values (0V to 1V typical for signals)
 
-    This makes the analyzer work for both AC and DC sweep workflows.
+    This makes the analyzer work for simple and complex circuits.
     """
     signal_nets = set()
 
@@ -209,10 +212,9 @@ def find_signal_source_nets(graph):
     if signal_nets:
         return signal_nets
 
-    # Step 2: No AC sources found - use DC source heuristic for DC sweep analysis
-    # Collect all voltage and current sources with their DC values
-    voltage_sources = []  # (node, dc_value, nets)
-    current_sources = []  # (node, dc_value, nets)
+    # Step 2: Collect all voltage and current sources with metadata
+    voltage_sources = []  # (node, device_name, dc_value, nets)
+    current_sources = []  # (node, device_name, dc_value, nets)
 
     for node, data in graph.nodes(data=True):
         if data["kind"] != "device":
@@ -222,6 +224,7 @@ def find_signal_source_nets(graph):
         if dtype not in {"V", "I"}:
             continue
 
+        device_name = node.replace("dev:", "").lower()
         raw_line = data.get("raw", "")
         dc_value = _parse_dc_value(raw_line)
 
@@ -234,28 +237,68 @@ def find_signal_source_nets(graph):
                     nets.add(neighbor)
 
         if dtype == "V":
-            voltage_sources.append((node, dc_value, nets))
+            voltage_sources.append((node, device_name, dc_value, nets))
         else:  # Current source
-            current_sources.append((node, dc_value, nets))
+            current_sources.append((node, device_name, dc_value, nets))
 
-    # Apply heuristic: prefer current sources (less common, likely signals)
-    # Return ONLY the single source with lowest DC value (not all sources!)
+    # Step 3: NAME-BASED detection for complex circuits
+    # Signal name patterns (common signal source naming)
+    signal_patterns = ['vin', 'sig', 'data', 'in', 'ctrl', 'cont', 'input',
+                      'tx', 'rx', 'clk', 'ref', 'test', 'src']
+    # Supply rail patterns to exclude
+    supply_patterns = ['vdd', 'vcc', 'vss', 'vee', 'gnd', 'supply', 'rail',
+                      'dd_', '_dd', 'ss_', '_ss', 'analog', 'bias']
+
+    def is_likely_signal(name):
+        """Check if source name matches signal patterns."""
+        name_lower = name.lower()
+        # Check if any signal pattern is in the name
+        has_signal = any(pat in name_lower for pat in signal_patterns)
+        # Check if any supply pattern is in the name
+        has_supply = any(pat in name_lower for pat in supply_patterns)
+        return has_signal and not has_supply
+
+    # Try name-based detection on all sources
     signal_source_nets = set()
 
+    # Check current sources first (higher priority)
+    for node, name, dc_val, nets in current_sources:
+        if is_likely_signal(name):
+            signal_source_nets.update(nets)
+
+    # Check voltage sources
+    for node, name, dc_val, nets in voltage_sources:
+        if is_likely_signal(name):
+            signal_source_nets.update(nets)
+
+    # If name-based detection found signals, return them
+    if signal_source_nets:
+        return signal_source_nets
+
+    # Step 4: Fall back to DC value heuristic for simple circuits
+    # Prefer current sources (less common, likely signals)
     if current_sources:
         # Sort by absolute DC value, lowest first
-        current_sources.sort(key=lambda x: abs(x[1]))
+        current_sources.sort(key=lambda x: abs(x[2]))
         # Use ONLY the current source with lowest |DC| as signal
-        signal_source_nets = current_sources[0][2]
+        signal_source_nets = current_sources[0][3]
     elif voltage_sources:
-        # Sort by DC value (ascending)
-        voltage_sources.sort(key=lambda x: x[1])
+        # For voltage sources, use smarter heuristic:
+        # - Exclude extreme values (likely supply rails)
+        # - Prefer sources with DC values in signal range (0-1V)
 
-        # Use ONLY the SINGLE lowest voltage source as signal
-        # (highest voltage is supply rail, middle voltages are biases)
-        if len(voltage_sources) >= 1:
-            # Take only the lowest voltage source (typically 0V)
-            signal_source_nets = voltage_sources[0][2]
+        # Filter sources by DC value (likely signals: -1V to 1V)
+        signal_range_sources = [(n, name, dc, nets) for n, name, dc, nets in voltage_sources
+                               if -1.0 <= dc <= 1.0]
+
+        if signal_range_sources:
+            # Use all sources in signal range
+            for node, name, dc_val, nets in signal_range_sources:
+                signal_source_nets.update(nets)
+        elif voltage_sources:
+            # Fall back to single lowest voltage source (legacy behavior)
+            voltage_sources.sort(key=lambda x: x[2])
+            signal_source_nets = voltage_sources[0][3]
 
     return signal_source_nets
 

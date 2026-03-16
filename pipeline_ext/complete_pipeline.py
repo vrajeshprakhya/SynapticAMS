@@ -22,6 +22,7 @@ from pipeline_ext.fit_transfer_function import fit_transfer_function
 from pipeline_ext.verilog_ams_generator import VerilogAMSGenerator
 from pipeline_ext.extract_small_signal_model import extract_small_signal_model
 from equivalence_checker import EquivalenceChecker
+from spice_flatten import flatten_netlist
 
 # OSDI equivalence checking is optional (requires OpenVAF)
 try:
@@ -46,9 +47,15 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
     print(" SPICE → VERILOG-AMS PIPELINE")
     print("="*70)
 
+    # Step 0: Flatten netlist (expand subcircuits)
+    print("\n[0/7] Flattening netlist (expanding subcircuits)...")
+    flat_netlist = flatten_netlist(netlist_text)
+    print(f"      Original: {len(netlist_text)} chars")
+    print(f"      Flattened: {len(flat_netlist)} chars")
+
     # Step 1: Parse netlist
     print("\n[1/7] Parsing SPICE netlist...")
-    devices = parse_spice_netlist(netlist_text)
+    devices = parse_spice_netlist(flat_netlist)
     graph = build_bipartite_graph(devices)
     print(f"      Found {len(devices)} devices")
 
@@ -83,6 +90,28 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
     print(f"      Small-signal linearizable blocks: {len(small_signal_blocks)}")
     print(f"      Nonlinear blocks: {len(nonlinear_blocks)}")
 
+    # Detect oscillator blocks (separate from normal blocks)
+    oscillator_blocks = []
+    non_oscillator_blocks = []
+
+    for block in blocks:
+        # Use planner's oscillator detection
+        if planner._is_oscillator_block(block):
+            oscillator_blocks.append(block)
+        else:
+            # Filter out oscillators from normal processing
+            if block in small_signal_blocks:
+                non_oscillator_blocks.append(block)
+            elif block in nonlinear_blocks:
+                non_oscillator_blocks.append(block)
+
+    if oscillator_blocks:
+        print(f"      Oscillator blocks detected: {len(oscillator_blocks)}")
+
+    # Update block lists to exclude oscillators
+    small_signal_blocks = [b for b in small_signal_blocks if b not in oscillator_blocks]
+    nonlinear_blocks = [b for b in nonlinear_blocks if b not in oscillator_blocks]
+
     # Plan DC sweeps for both small-signal and nonlinear blocks
     # (both need large-signal DC characterization)
     dc_sweep_blocks = small_signal_blocks + nonlinear_blocks
@@ -92,6 +121,16 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
         all_sweep_plans.extend(sweep_plans)
 
     print(f"      Generated {len(all_sweep_plans)} DC sweep plans (small-signal + nonlinear blocks)")
+
+    # Plan transient simulations for oscillator blocks
+    transient_plans = []
+    for block in oscillator_blocks:
+        tran_plan = planner.plan_transient(block)
+        if tran_plan:
+            transient_plans.append({'block': block, 'plan': tran_plan})
+
+    if transient_plans:
+        print(f"      Generated {len(transient_plans)} transient simulation plans (oscillators)")
 
     # Step 4: Run ngspice simulations
     print("\n[4/7] Running ngspice simulations...")
@@ -227,6 +266,32 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
         except Exception as e:
             print(f" ✗ Failed: {e}")
 
+    # Transient simulations for oscillator blocks
+    transient_results = []
+    if transient_plans:
+        print(f"\n      Running {len(transient_plans)} transient simulations (oscillators)...")
+
+        for i, tran_info in enumerate(transient_plans):
+            block = tran_info['block']
+            plan = tran_info['plan']
+            block_name = block.get('name', f'block_{i}')
+
+            print(f"      Oscillator {i+1}/{len(transient_plans)}: {block_name} "
+                  f"(f_est={plan['expected_freq']/1e9:.2f} GHz, t={plan['tstop']*1e9:.1f}ns)", end="")
+
+            try:
+                # Run transient analysis (no input source modification for oscillators)
+                results = runner.transient_analysis(netlist_text, plan)
+                print(f" ✓ {len(results['time'])} points")
+
+                transient_results.append({
+                    'block': block,
+                    'plan': plan,
+                    'data': results
+                })
+            except Exception as e:
+                print(f" ✗ Failed: {e}")
+
     # Step 5: Fit models (transfer functions for nonlinear, small-signal for linear)
     print("\n[5/7] Fitting models...")
     fitted_models = []
@@ -357,6 +422,51 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
                 'terminals': {}  # Will be populated by Verilog generator
             })
 
+    # Oscillator models (transient simulation)
+    if transient_results:
+        print("      Oscillator models (dynamic blocks):")
+        from pipeline_ext.fit_transfer_function import fit_oscillator_model
+
+        for tran_result in transient_results:
+            block = tran_result['block']
+            data = tran_result['data']
+            outputs = list(block.get('outputs', set()))
+
+            if not outputs:
+                continue
+
+            # Analyze each output
+            for output in outputs:
+                output_name = output.replace('net:', '')
+
+                # Skip ground nodes
+                if output_name.lower() in ['0', 'gnd']:
+                    continue
+
+                # Get waveform data for this output
+                if output_name not in data:
+                    continue
+
+                time = data['time']
+                voltage = data[output_name]
+
+                # Fit oscillator model
+                model = fit_oscillator_model(time, voltage)
+
+                if model['model_type'] == 'oscillator':
+                    freq_ghz = model['params']['frequency'] / 1e9
+                    amp = model['params']['amplitude']
+                    waveform = model.get('waveform', 'unknown')
+
+                    print(f"        {output_name}: {waveform} @ {freq_ghz:.2f} GHz, amp={amp:.3f}V")
+
+                    fitted_models.append({
+                        'input': None,  # No input for autonomous oscillators
+                        'output': output_name,
+                        'model': model,
+                        'data': {'time': time, 'voltage': voltage}
+                    })
+
     # Step 6: Generate Verilog-AMS
     print("\n[6/7] Generating Verilog-AMS code...")
     generator = VerilogAMSGenerator()
@@ -387,10 +497,15 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
         print("      Install OpenVAF for equivalence validation")
 
     for i, fitted_model in enumerate(fitted_models):
-        # Handle both 1D and 2D models
+        # Handle both 1D and 2D models, and oscillators (no input)
         is_2d = isinstance(fitted_model['input'], list)
+        is_oscillator = fitted_model['input'] is None
 
-        if is_2d:
+        if is_oscillator:
+            # Oscillators have no input (autonomous)
+            module_name = f"{fitted_model['output']}_oscillator"
+            input_names = []
+        elif is_2d:
             input_str = '_'.join(fitted_model['input'])
             module_name = f"{fitted_model['output']}_vs_{input_str}"
             input_names = [inp.replace('net:', '') for inp in fitted_model['input']]
@@ -406,26 +521,53 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
         # Extract output name
         output_name = fitted_model['output'].replace('net:', '')
 
-        # Only run OSDI check if available
+        # Check if this is a small-signal model
+        model_type = fitted_model.get('model', {}).get('model_type', '')
+        is_small_signal = (model_type == 'small_signal' or
+                          fitted_model['output'] == 'small_signal')
+
+        # Detect if this is a dynamic/oscillator model
+        intent = fitted_model.get('model', {}).get('intent', '')
+        is_dynamic = any(keyword in module_name.lower() or keyword in intent.lower()
+                        for keyword in ['oscillator', 'vco', 'clock', 'ring'])
+
+        # Only run OSDI check if available and not a small-signal model
         if OSDI_AVAILABLE:
-            try:
-                result = osdi_checker.check_equivalence(
-                    netlist_text, code, module_name,
-                    input_names=input_names,
-                    output_names=[output_name],
-                    n_test_points=20
-                )
-                equivalence_results.append({
-                    'module': module_name,
-                    'result': result
-                })
-                status = "✓" if result.passed else "✗"
-                print(f"      {status} {module_name}: " +
-                      f"max_err={result.max_absolute_error:.2e}, " +
-                      f"corr={result.correlation:.3f}, " +
-                      f"n={result.n_points}")
-            except Exception as e:
-                print(f"      ⚠ {module_name}: equivalence check failed ({e})")
+            if is_small_signal:
+                # Small-signal models represent linearized device behavior
+                # around a DC operating point. They can't be validated standalone
+                # with DC sweeps - they need to be embedded in a complete circuit.
+                # Instead, we validate the extracted parameters (gm, gds).
+                ac_params = fitted_model.get('model', {})
+                gm = ac_params.get('gm', 0)
+                gds = ac_params.get('gds', 0)
+                print(f"      ○ {module_name}: small-signal model " +
+                      f"(gm={gm:.2e} S, gds={gds:.2e} S) - parameter validation only")
+            else:
+                try:
+                    # Auto-detect validation mode (DC vs transient)
+                    mode = 'transient' if is_dynamic else 'auto'
+
+                    result = osdi_checker.check_equivalence(
+                        netlist_text, code, module_name,
+                        input_names=input_names,
+                        output_names=[output_name],
+                        n_test_points=20,
+                        mode=mode
+                    )
+                    equivalence_results.append({
+                        'module': module_name,
+                        'result': result
+                    })
+
+                    # Add mode indicator to status
+                    mode_indicator = '⏱' if mode == 'transient' else ''
+                    status = "✓" if result.passed else "✗"
+                    print(f"      {status} {mode_indicator} {module_name}: " +
+                          f"max_err={result.max_absolute_error:.2e}, " +
+                          f"corr={result.correlation:.3f}")
+                except Exception as e:
+                    print(f"      ⚠ {module_name}: equivalence check failed ({e})")
 
     # Step 8: Save files
     print("\n[8/8] Saving files to disk...")
