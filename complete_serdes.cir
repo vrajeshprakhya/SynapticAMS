@@ -1,0 +1,254 @@
+* Complete SerDes: Analog VCO + OpenSERDES Digital Blocks
+* Architecture: VCO -> Serializer -> TX Driver -> Channel -> RX -> DFF Sampler -> Deserializer
+* Purpose: Realistic SerDes IP combining analog and digital blocks
+* Date: 2026-03-17
+
+.title Complete SerDes with VCO and Digital Logic
+
+* =============================================================================
+* PARAMETERS
+* =============================================================================
+.param vdd=1.8              $ Supply voltage (Sky130 compatible)
+.param vcc=3.3              $ VCO supply (for ADC bridge in VCO)
+.param vcont=1.5            $ VCO control voltage (for ~600 MHz)
+.param data_rate=100e6      $ 100 MHz data rate
+
+* =============================================================================
+* SUBCIRCUIT DEFINITIONS
+* =============================================================================
+
+* VCO Subcircuit (7-stage differential ring oscillator) - ANALOG BLOCK
+.include blocks/vco_sub.cir
+
+* Simple Inverter (building block)
+.subckt Inverter0 GND VDD INP OUT
+M0 OUT INP GND GND nshort L=0.15u W=2u
+M1 OUT INP VDD VDD pshort L=0.15u W=4u
+.ends Inverter0
+
+* NAND gate (for DFF)
+.subckt NAND2 GND VDD A B OUT
+M0 OUT A net1 GND nshort L=0.15u W=2u
+M1 net1 B GND GND nshort L=0.15u W=2u
+M2 OUT A VDD VDD pshort L=0.15u W=4u
+M3 OUT B VDD VDD pshort L=0.15u W=4u
+.ends NAND2
+
+* D Flip-Flop (master-slave using NAND gates)
+.subckt DFF GND VDD D CLK Q
+* Master latch
+X1 GND VDD D CLK net_m1 NAND2
+X2 GND VDD net_m1 CLK net_m2 NAND2
+* Slave latch
+X3 GND VDD net_m2 CLK net_s1 NAND2
+X4 GND VDD net_s1 CLK Q NAND2
+.ends DFF
+
+* Resistive Feedback Inverter (RX sensing element)
+.subckt Resist_FB_INV GND VDD INP OUT
+M0 OUT INP GND GND nshort L=0.15u W=5u
+M1 OUT INP VDD VDD pshort L=0.15u W=10u
+Rfb OUT INP 50k
+.ends Resist_FB_INV
+
+* TX Driver (inverter chain for driving channel)
+.subckt TX_Driver GND VDD INP OUT
+Xinv1 GND VDD INP stage1 Inverter0
+M0 OUT stage1 GND GND nshort L=0.15u W=20u m=4
+M1 OUT stage1 VDD VDD pshort L=0.15u W=40u m=4
+.ends TX_Driver
+
+* Simple 4:1 Serializer (4-bit parallel to 1-bit serial)
+* Uses data rate clock for serialization
+.subckt Serializer GND VDD D0 D1 D2 D3 CLK SOUT
+* MUX select counter (2-bit, clocked by CLK)
+* For simplicity: just use D0 as serial output (placeholder for full serializer)
+* Full implementation would need counter + 4:1 mux
+Xbuf GND VDD D0 SOUT Inverter0
+.ends Serializer
+
+* Simple 1:4 Deserializer (1-bit serial to 4-bit parallel)
+* Shift register clocked by recovered clock
+.subckt Deserializer GND VDD SIN CLK Q0 Q1 Q2 Q3
+* Shift register: 4 cascaded DFFs
+Xdff0 GND VDD SIN CLK Q0 DFF
+Xdff1 GND VDD Q0 CLK Q1 DFF
+Xdff2 GND VDD Q1 CLK Q2 DFF
+Xdff3 GND VDD Q2 CLK Q3 DFF
+.ends Deserializer
+
+* =============================================================================
+* SUPPLY VOLTAGES
+* =============================================================================
+VDD dd 0 DC {vdd}
+VDD_VCO dd_vco 0 DC {vcc}
+
+* =============================================================================
+* CLOCK GENERATION (VCO)
+* =============================================================================
+Vcont vcont 0 DC {vcont}
+
+* VCO instantiation: ro_vco(aout, dout, cont, vdd)
+* Generates ~600 MHz clock
+Xvco vco_clk vco_dig vcont dd_vco ro_vco
+
+* Buffer VCO clock for TX and RX
+Xvco_buf dd 0 vco_clk tx_clk Inverter0
+
+* =============================================================================
+* TX PATH
+* =============================================================================
+
+* TX Input Data (4-bit parallel data)
+* For testing: static pattern 1010
+Vdata0 tx_d0 0 DC {vdd}      $ bit 0 = 1
+Vdata1 tx_d1 0 DC 0          $ bit 1 = 0
+Vdata2 tx_d2 0 DC {vdd}      $ bit 2 = 1
+Vdata3 tx_d3 0 DC 0          $ bit 3 = 0
+
+* Serializer: 4-bit parallel to 1-bit serial
+Xserializer dd 0 tx_d0 tx_d1 tx_d2 tx_d3 tx_clk tx_serial Serializer
+
+* TX Driver: Drive serial data onto channel
+Xtx_driver dd 0 tx_serial tx_out TX_Driver
+
+* TX Output termination
+Rtx_term tx_out 0 50
+
+* =============================================================================
+* CHANNEL
+* =============================================================================
+* Simple RC transmission line model (10cm trace)
+
+* Channel resistance
+Rchan tx_out rx_in 2
+
+* Channel capacitance
+Cchan rx_in 0 10p
+
+* =============================================================================
+* RX PATH
+* =============================================================================
+
+* RX Front-end: Resistive feedback inverter for sensing
+Xrx_sense dd 0 rx_in rx_sensed Resist_FB_INV
+
+* RX Buffer/Amplifier
+Xrx_amp dd 0 rx_sensed rx_data Inverter0
+
+* Data sampling DFF (sample with recovered clock)
+* For simplicity: use TX clock (ideal CDR)
+Xrx_sampler dd 0 rx_data tx_clk rx_sampled DFF
+
+* Deserializer: 1-bit serial to 4-bit parallel
+Xdeserializer dd 0 rx_sampled tx_clk rx_q0 rx_q1 rx_q2 rx_q3 Deserializer
+
+* RX Output loads
+Crx_load0 rx_q0 0 1f
+Crx_load1 rx_q1 0 1f
+Crx_load2 rx_q2 0 1f
+Crx_load3 rx_q3 0 1f
+
+* =============================================================================
+* TRANSISTOR MODELS (Sky130-like Level 1 for simplicity)
+* =============================================================================
+
+.model nshort NMOS (
++  Level=1
++  Vto=0.7
++  Kp=200u
++  Gamma=0.4
++  Phi=0.7
++  Lambda=0.02
++  Tox=9n
++)
+
+.model pshort PMOS (
++  Level=1
++  Vto=-0.7
++  Kp=100u
++  Gamma=0.4
++  Phi=0.7
++  Lambda=0.02
++  Tox=9n
++)
+
+* BSIM3 NMOS model (for VCO from original file)
+.model N1 NMOS
++version = 3.3.0
++Level=        8
++Tnom=27.0
++Nch= 2.498E+17  Tox=9E-09 Xj=1.00000E-07
++Lint=9.36e-8 Wint=1.47e-7
++Vth0= .6322    K1= .756  K2= -3.83e-2  K3= -2.612
++Dvt0= 2.812  Dvt1= 0.462  Dvt2=-9.17e-2
++Nlx= 3.52291E-08  W0= 1.163e-6
++K3b= 2.233
++Vsat= 86301.58  Ua= 6.47e-9  Ub= 4.23e-18  Uc=-4.706281E-11
++Rdsw= 650  U0= 388.3203 wr=1
++A0= .3496967 Ags=.1    B0=0.546    B1= 1
++ Dwg = -6.0E-09 Dwb = -3.56E-09 Prwb = -.213
++Keta=-3.605872E-02  A1= 2.778747E-02  A2= .9
++Voff=-6.735529E-02  NFactor= 1.139926  Cit= 1.622527E-04
++Cdsc=-2.147181E-05
++Cdscb= 0  Dvt0w =  0 Dvt1w =  0 Dvt2w =  0
++ Cdscd =  0 Prwg =  0
++Eta0= 1.0281729E-02  Etab=-5.042203E-03
++Dsub= .31871233
++Pclm= 1.114846  Pdiblc1= 2.45357E-03  Pdiblc2= 6.406289E-03
++Drout= .31871233  Pscbe1= 5000000  Pscbe2= 5E-09 Pdiblcb = -.234
++Pvag= 0 delta=0.01
++ Wl =  0 Ww = -1.420242E-09 Wwl =  0
++ Wln =  0 Wwn =  .2613948 Ll =  1.300902E-10
++ Lw =  0 Lwl =  0 Lln =  .316394
++ Lwn =  0
++kt1=-.3  kt2=-.051
++At= 22400
++Ute=-1.48
++Ua1= 3.31E-10  Ub1= 2.61E-19 Uc1= -3.42e-10
++Kt1l=0 Prt=764.3
+
+* BSIM3 PMOS model (for VCO from original file)
+.model P1 PMOS
++version = 3.3.0
++Level=        8
++Tnom=27.0
++Nch= 3.533024E+17  Tox=9E-09 Xj=1.00000E-07
++Lint=6.23e-8 Wint=1.22e-7
++Vth0=-.6732829 K1= .8362093  K2=-8.606622E-02  K3= 1.82
++Dvt0= 1.903801  Dvt1= .5333922  Dvt2=-.1862677
++Nlx= 1.28e-8  W0= 2.1e-6
++K3b= -0.24 Prwg=-0.001 Prwb=-0.323
++Vsat= 103503.2  Ua= 1.39995E-09  Ub= 1.e-19  Uc=-2.73e-11
++ Rdsw= 460  U0= 138.7609
++A0= .4716551 Ags=0.12
++Keta=-1.871516E-03  A1= .3417965  A2= 0.83
++Voff=-.074182  NFactor= 1.54389  Cit=-1.015667E-03
++Cdsc= 8.937517E-04
++Cdscb= 1.45e-4  Cdscd=1.04e-4
++ Dvt0w=0.232 Dvt1w=4.5e6 Dvt2w=-0.0023
++Eta0= 6.024776E-02  Etab=-4.64593E-03
++Dsub= .23222404
++Pclm= .989  Pdiblc1= 2.07418E-02  Pdiblc2= 1.33813E-3
++Drout= .3222404  Pscbe1= 118000  Pscbe2= 1E-09
++Pvag= 0
++kt1= -0.25  kt2= -0.032 prt=64.5
++At= 33000
++Ute= -1.5
++Ua1= 4.312e-9 Ub1= 6.65e-19  Uc1= 0
++Kt1l=0
+
+* =============================================================================
+* ANALYSIS
+* =============================================================================
+
+* Operating Point
+.OP
+
+* Transient Analysis: Observe complete SerDes operation
+.TRAN 100p 50n
+
+* Print key nodes
+.PRINT TRAN v(vco_clk) v(tx_serial) v(tx_out) v(rx_in) v(rx_data) v(rx_q0)
+
+.END

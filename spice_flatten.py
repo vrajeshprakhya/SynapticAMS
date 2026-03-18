@@ -267,7 +267,7 @@ class SpiceFlattener:
                     # anywhere in the netlist (not just after their definition).
                     inner, end_idx = self._parse_subcircuit(lines, i)
                     self.subcircuits[inner.name.upper()] = inner
-                    i = end_idx
+                    i = end_idx + 1  # Skip past the nested subcircuit's .ENDS line
                     # Don't descend further — _parse_subcircuit handled it.
                     depth -= 1  # restore: we consumed the matching .ENDS
                     continue
