@@ -6,7 +6,7 @@
 .param vcc=3.3
 
 * Include VCO subcircuit definition
-.include vco_sub.cir
+.include ../../blocks/vco_sub.cir
 
 * Supply voltages
 VDD dd 0 DC 3.3

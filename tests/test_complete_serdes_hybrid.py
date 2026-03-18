@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hybrid_ensemble import ensemble_pipeline
 
@@ -29,7 +29,7 @@ def main():
     print()
 
     # Read the complete SerDes netlist
-    netlist_path = "complete_serdes.cir"
+    netlist_path = Path(__file__).parent.parent / 'examples/netlists/complete_serdes.cir'
     with open(netlist_path) as f:
         netlist = f.read()
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from hybrid_ensemble import ensemble_pipeline
 
 # Read the netlist (use clean version without .control blocks)
-netlist_path = Path("test_netlist_simple.cir")
+netlist_path = Path(__file__).parent.parent / 'examples/netlists/test_netlist_simple.cir'
 netlist = netlist_path.read_text()
 
 print("=" * 72)

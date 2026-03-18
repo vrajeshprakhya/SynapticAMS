@@ -3,16 +3,18 @@
 Quick test of Remote Ollama with simple VCO circuit
 """
 
+from pathlib import Path
 from hybrid_ensemble import ensemble_pipeline
 
 # Load simple VCO netlist
-with open('test_vco_simple.cir', 'r') as f:
+netlist_path = Path(__file__).parent.parent / 'examples/netlists/test_vco_simple.cir'
+with open(netlist_path, 'r') as f:
     netlist = f.read()
 
 print("="*80)
 print("QUICK TEST: Remote Ollama with VCO Circuit")
 print("="*80)
-print(f"Netlist:     test_vco_simple.cir (3-stage ring oscillator)")
+print(f"Netlist:     examples/netlists/test_vco_simple.cir (3-stage ring oscillator)")
 print(f"AI Backend:  Ollama @ http://192.168.1.31:11434")
 print(f"Mode:        Parallel execution")
 print("="*80)

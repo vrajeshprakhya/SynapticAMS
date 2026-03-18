@@ -4,18 +4,20 @@ Test Hybrid Ensemble Pipeline with Remote Ollama
 Tests the SerDes circuit with AI (remote Ollama) + Programmatic pipelines running in parallel
 """
 
+from pathlib import Path
 from hybrid_ensemble import ensemble_pipeline
 import sys
 
 def main():
     # Load SerDes netlist
-    with open('serdes_top.cir', 'r') as f:
+    netlist_path = Path(__file__).parent.parent / 'examples/netlists/serdes_top.cir'
+    with open(netlist_path, 'r') as f:
         netlist = f.read()
 
     print("="*80)
     print("TESTING HYBRID ENSEMBLE WITH REMOTE OLLAMA")
     print("="*80)
-    print(f"Netlist:     serdes_top.cir")
+    print(f"Netlist:     examples/netlists/serdes_top.cir")
     print(f"AI Backend:  Ollama @ http://192.168.1.31:11434")
     print(f"AI Model:    llama3.2:3b (auto-selected)")
     print(f"Mode:        Parallel execution")
