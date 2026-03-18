@@ -453,26 +453,53 @@ class SimulationPlanner:
         # Detect if this is an oscillator/VCO circuit
         is_oscillator = self._is_oscillator_block(block)
 
-        if not is_oscillator:
-            return None
-
         # Determine simulation parameters based on expected frequency
-        expected_freq = self._estimate_oscillator_frequency(block)
+        # For oscillators: use estimated frequency
+        # For non-oscillators: use conservative time scale
+        if is_oscillator:
+            expected_freq = self._estimate_oscillator_frequency(block)
+        else:
+            # For amplifiers/filters, use a reasonable time scale
+            # Assume ~1MHz typical signal frequency
+            expected_freq = 1e6  # 1 MHz
 
-        # Run for at least 10 cycles to capture steady-state
+        # Determine simulation duration
         period = 1.0 / expected_freq if expected_freq > 0 else 1e-6
-        tstop = 10 * period
+
+        # For oscillators: run longer to ensure steady-state (skip startup transients)
+        # For amplifiers: 10 cycles is sufficient
+        if is_oscillator:
+            # Run for 30 cycles AND at least 20ns to ensure settled behavior
+            # (Oscillators need more time to reach steady-state amplitude/offset)
+            tstop = max(30 * period, 20e-9)
+        else:
+            tstop = 10 * period
+
         tstep = period / 100  # 100 points per cycle
 
-        # Convert output nets to node names
+        # Convert output nets to node names and filter out subcircuit internal nodes
         observe_vars = [n.replace("net:", "") for n in outputs]
+
+        # Filter out subcircuit internal nodes (e.g., "Xinstance_internalnode")
+        # Keep only top-level nodes (no "X" prefix or direct subcircuit pins)
+        filtered_vars = []
+        for var in observe_vars:
+            # Skip if it looks like a subcircuit internal node (starts with X and has underscore)
+            # e.g., "Xtx_driver_tail" is subcircuit internal, "tx_out_p" is top-level
+            if var.startswith('X') and '_' in var:
+                continue  # Skip subcircuit internal nodes
+            filtered_vars.append(var)
+
+        if not filtered_vars:
+            # Fallback: if all nodes were filtered, use original list
+            filtered_vars = observe_vars
 
         return {
             'type': 'transient',
             'tstop': tstop,
             'tstep': tstep,
             'tstart': 5 * period,  # Skip first 5 cycles for settling
-            'observe': observe_vars,
+            'observe': filtered_vars,
             'uic': True,  # Use initial conditions for oscillators
             'expected_freq': expected_freq
         }
@@ -493,6 +520,14 @@ class SimulationPlanner:
         oscillator_keywords = ['osc', 'vco', 'ring', 'pll', 'clock', 'clk']
         if any(keyword in block_name for keyword in oscillator_keywords):
             return True
+
+        # Check netlist content for VCO/oscillator subcircuits or instances
+        if hasattr(self, 'netlist'):
+            netlist_lower = self.netlist.lower()
+            # Look for VCO subcircuit includes or instantiations
+            vco_patterns = ['vco_sub', 'ro_vco', 'ring_osc', '.include.*vco']
+            if any(pattern in netlist_lower for pattern in vco_patterns):
+                return True
 
         # Topology-based detection: ring oscillators have odd number of inverters
         # (This would require more sophisticated graph analysis)

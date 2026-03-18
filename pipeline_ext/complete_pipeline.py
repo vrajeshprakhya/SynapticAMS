@@ -23,6 +23,7 @@ from pipeline_ext.verilog_ams_generator import VerilogAMSGenerator
 from pipeline_ext.extract_small_signal_model import extract_small_signal_model
 from equivalence_checker import EquivalenceChecker
 from spice_flatten import flatten_netlist
+import re
 
 # OSDI equivalence checking is optional (requires OpenVAF)
 try:
@@ -31,6 +32,106 @@ try:
 except ImportError:
     OSDI_AVAILABLE = False
     OSDIEquivalenceChecker = None
+
+# Oscillator-specific equivalence checking (frequency-domain)
+try:
+    from oscillator_equivalence import check_oscillator_equivalence
+    OSCILLATOR_CHECKER_AVAILABLE = True
+except ImportError:
+    OSCILLATOR_CHECKER_AVAILABLE = False
+    check_oscillator_equivalence = None
+
+
+def extract_device_bias(netlist_text, device_name):
+    """
+    Extract DC bias voltages for a device from the netlist.
+
+    Attempts to find the DC operating point by:
+    1. Finding the device's terminals in the netlist
+    2. Tracing back to voltage sources on those nets
+    3. Extracting DC values from the sources
+
+    Args:
+        netlist_text: SPICE netlist string
+        device_name: Device name (e.g., 'M1')
+
+    Returns:
+        dict: {'vg_dc': float or None, 'vd_dc': float or None}
+    """
+    bias = {'vg_dc': None, 'vd_dc': None}
+
+    # Find device line
+    device_terminals = None
+    for line in netlist_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('*') or stripped.startswith('.'):
+            continue
+
+        tokens = stripped.split()
+        if tokens and tokens[0].upper() == device_name.upper():
+            if len(tokens) >= 5:
+                # MOSFET: M name D G S B model
+                device_terminals = {
+                    'drain': tokens[1].lower(),
+                    'gate': tokens[2].lower(),
+                    'source': tokens[3].lower(),
+                }
+            break
+
+    if not device_terminals:
+        # Use defaults
+        return {'vg_dc': 0.9, 'vd_dc': 1.8}
+
+    # Find voltage sources connected to gate and drain
+    for line in netlist_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('*') or stripped.startswith('.'):
+            continue
+
+        tokens = stripped.split()
+        if not tokens or tokens[0][0].upper() != 'V':
+            continue
+
+        if len(tokens) >= 3:
+            # Voltage source: V name N+ N- DC value
+            pos_node = tokens[1].lower()
+
+            # Check if this source connects to gate or drain
+            if pos_node == device_terminals['gate']:
+                # Extract DC voltage
+                dc_match = re.search(r'\bDC\s+([\d\.eE+-]+)', stripped, re.I)
+                if dc_match:
+                    try:
+                        bias['vg_dc'] = float(dc_match.group(1))
+                    except ValueError:
+                        pass
+                elif len(tokens) >= 4 and not tokens[3].upper().startswith(('AC', 'PULSE', 'SIN')):
+                    # Implicit DC value (4th token)
+                    try:
+                        bias['vg_dc'] = float(tokens[3].replace('V', ''))
+                    except ValueError:
+                        pass
+
+            if pos_node == device_terminals['drain']:
+                dc_match = re.search(r'\bDC\s+([\d\.eE+-]+)', stripped, re.I)
+                if dc_match:
+                    try:
+                        bias['vd_dc'] = float(dc_match.group(1))
+                    except ValueError:
+                        pass
+                elif len(tokens) >= 4 and not tokens[3].upper().startswith(('AC', 'PULSE', 'SIN')):
+                    try:
+                        bias['vd_dc'] = float(tokens[3].replace('V', ''))
+                    except ValueError:
+                        pass
+
+    # Fallback to reasonable defaults
+    if bias['vg_dc'] is None:
+        bias['vg_dc'] = 0.9
+    if bias['vd_dc'] is None:
+        bias['vd_dc'] = 1.8
+
+    return bias
 
 def spice_to_verilog_ams(netlist_text, output_dir='.'):
     """
@@ -90,28 +191,6 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
     print(f"      Small-signal linearizable blocks: {len(small_signal_blocks)}")
     print(f"      Nonlinear blocks: {len(nonlinear_blocks)}")
 
-    # Detect oscillator blocks (separate from normal blocks)
-    oscillator_blocks = []
-    non_oscillator_blocks = []
-
-    for block in blocks:
-        # Use planner's oscillator detection
-        if planner._is_oscillator_block(block):
-            oscillator_blocks.append(block)
-        else:
-            # Filter out oscillators from normal processing
-            if block in small_signal_blocks:
-                non_oscillator_blocks.append(block)
-            elif block in nonlinear_blocks:
-                non_oscillator_blocks.append(block)
-
-    if oscillator_blocks:
-        print(f"      Oscillator blocks detected: {len(oscillator_blocks)}")
-
-    # Update block lists to exclude oscillators
-    small_signal_blocks = [b for b in small_signal_blocks if b not in oscillator_blocks]
-    nonlinear_blocks = [b for b in nonlinear_blocks if b not in oscillator_blocks]
-
     # Plan DC sweeps for both small-signal and nonlinear blocks
     # (both need large-signal DC characterization)
     dc_sweep_blocks = small_signal_blocks + nonlinear_blocks
@@ -120,17 +199,17 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
         sweep_plans = planner.plan_dc_sweep(block)
         all_sweep_plans.extend(sweep_plans)
 
-    print(f"      Generated {len(all_sweep_plans)} DC sweep plans (small-signal + nonlinear blocks)")
+    print(f"      Generated {len(all_sweep_plans)} DC sweep plans")
 
-    # Plan transient simulations for oscillator blocks
+    # Plan transient simulations for ALL blocks (not just oscillators)
     transient_plans = []
-    for block in oscillator_blocks:
+    for block in blocks:
         tran_plan = planner.plan_transient(block)
         if tran_plan:
             transient_plans.append({'block': block, 'plan': tran_plan})
 
     if transient_plans:
-        print(f"      Generated {len(transient_plans)} transient simulation plans (oscillators)")
+        print(f"      Generated {len(transient_plans)} transient simulation plans")
 
     # Step 4: Run ngspice simulations
     print("\n[4/7] Running ngspice simulations...")
@@ -253,15 +332,61 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
                 print(f" ⚠ No transistors found, skipping")
                 continue
 
-            # Extract AC parameters
-            ac_params = runner.extract_ac_params(netlist_text, transistor_devices)
-            print(f" ✓ {len(transistor_devices)} devices")
+            # Try standard .OP method first
+            ac_params = None
+            extraction_method = None
+            try:
+                ac_params = runner.extract_ac_params(netlist_text, transistor_devices)
+                extraction_method = 'OP'
+            except Exception as op_error:
+                # Standard .OP method failed - try transient fallback
+                print(f"\n        .OP method failed ({op_error}), falling back to transient...")
+                ac_params = {}
 
-            small_signal_results.append({
-                'block': block,
-                'ac_params': ac_params,
-                'devices': transistor_devices
-            })
+                for device_name in transistor_devices:
+                    try:
+                        # Extract bias conditions from netlist
+                        bias = extract_device_bias(netlist_text, device_name)
+
+                        print(f"        {device_name}: trying transient @ Vgs={bias['vg_dc']:.2f}V, Vds={bias['vd_dc']:.2f}V...", end="")
+
+                        # Use transient-based extraction
+                        params_tran = runner.extract_ac_params_transient(
+                            netlist_text,
+                            device_name,
+                            vg_dc=bias['vg_dc'],
+                            vd_dc=bias['vd_dc'],
+                            perturbation_mv=10.0,
+                            freq_hz=1e6,
+                            n_periods=5
+                        )
+
+                        ac_params[device_name] = {
+                            'gm': params_tran['gm'],
+                            'gds': params_tran['gds'],
+                            'gmb': 0.0  # Not extracted by transient method
+                        }
+                        extraction_method = 'transient'
+                        print(f" ✓ gm={params_tran['gm']:.2e}")
+
+                    except Exception as tran_error:
+                        print(f" ✗ {tran_error}")
+                        # Set to zeros as last resort
+                        ac_params[device_name] = {'gm': 0.0, 'gds': 0.0, 'gmb': 0.0}
+
+            # Check if we got valid results
+            if ac_params and any(p['gm'] != 0.0 for p in ac_params.values()):
+                method_tag = f" ({extraction_method})" if extraction_method else ""
+                print(f" ✓ {len(transistor_devices)} devices{method_tag}")
+
+                small_signal_results.append({
+                    'block': block,
+                    'ac_params': ac_params,
+                    'devices': transistor_devices,
+                    'extraction_method': extraction_method
+                })
+            else:
+                print(f" ⚠ All extractions failed, skipping block")
 
         except Exception as e:
             print(f" ✗ Failed: {e}")
@@ -296,8 +421,20 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
     print("\n[5/7] Fitting models...")
     fitted_models = []
 
-    # Large-signal models (nonlinear blocks)
-    print("      Large-signal (nonlinear blocks):")
+    # Build lookup for transient data by output variable name
+    transient_by_output = {}
+    for tran_result in transient_results:
+        tran_data = tran_result['data']
+        # Map each output variable to its transient data
+        for var_name in tran_data.keys():
+            if var_name != 'time':  # Skip the time axis
+                transient_by_output[var_name] = {
+                    'time': tran_data['time'],
+                    'voltage': tran_data[var_name]
+                }
+
+    # Large-signal models (nonlinear blocks) + dynamic if transient available
+    print("      Large-signal (DC + dynamic models):")
     for sim_result in simulation_results:
         plan = sim_result['plan']
         data = sim_result['data']
@@ -336,7 +473,7 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
 
             continue
 
-        # Handle 1D sweeps
+        # Handle 1D sweeps (combine with transient if available)
         sweep_var = plan['sweep_var']
         x = data[sweep_var]
 
@@ -349,9 +486,46 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
             print(f"        {obs_var} = f({sweep_var})", end="")
 
             try:
-                model = fit_transfer_function(x, y)
+                # Try to find matching transient data
+                # obs_var might be 'v(out)' or 'out' - try both
+                obs_var_clean = obs_var.replace('v(', '').replace(')', '').replace('i(', '')
 
-                print(f" → {model['model_type']} ({model['intent']})")
+                transient_data = transient_by_output.get(obs_var_clean)
+
+                # Use dynamic fitting if transient available
+                if transient_data and len(transient_data['time']) > 0:
+                    from pipeline_ext.fit_transfer_function import fit_dynamic_transfer_function
+
+                    # Estimate step size from DC sweep range
+                    input_step_size = abs(x[-1] - x[0]) if len(x) > 1 else 1.0
+
+                    model = fit_dynamic_transfer_function(
+                        dc_x=x,
+                        dc_y=y,
+                        transient_time=transient_data['time'],
+                        transient_voltage=transient_data['voltage'],
+                        input_step_size=input_step_size
+                    )
+
+                    # Display combined metrics
+                    dc_gain = model['combined_params'].get('dc_gain')
+                    bandwidth = model['combined_params'].get('bandwidth')
+                    dc_gain_source = model['combined_params'].get('dc_gain_source')
+
+                    # Show source for ring oscillators (DC from transient, not DC sweep)
+                    source_tag = f"[{dc_gain_source}]" if dc_gain_source == 'transient' else ""
+
+                    if dc_gain is not None and bandwidth is not None:
+                        print(f" → dynamic (gain={dc_gain:.2f}{source_tag}, BW={bandwidth/1e6:.1f}MHz)")
+                    elif dc_gain is not None:
+                        print(f" → dynamic (gain={dc_gain:.2f}{source_tag}, DC-only)")
+                    else:
+                        print(f" → dynamic (no valid params)")
+
+                else:
+                    # DC-only fitting
+                    model = fit_transfer_function(x, y)
+                    print(f" → {model['model_type']} ({model['intent']})")
 
                 fitted_models.append({
                     'input': sweep_var,
@@ -362,6 +536,78 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
 
             except Exception as e:
                 print(f" → Failed: {e}")
+
+    # FALLBACK: If DC sweeps failed but we have transient data, fit from transient only
+    if len(simulation_results) == 0 and len(transient_results) > 0:
+        print("      Transient-only models (DC sweep failed):")
+        for tran_result in transient_results:
+            tran_data = tran_result['data']
+            tran_plan = tran_result['plan']
+            block = tran_result.get('block', {})
+
+            # Extract input signals from block control axes
+            control_axes = block.get('control_axes', set())
+            if control_axes:
+                # Use the block's control axes as inputs
+                input_signals = list(control_axes)
+                if len(input_signals) == 1:
+                    input_name = input_signals[0]
+                else:
+                    input_name = input_signals  # Multi-input (2D)
+            else:
+                # No control axes found - this is likely an autonomous block (oscillator)
+                # For oscillators, there's no meaningful input
+                input_name = None  # Will generate oscillator model instead
+
+            for var_name in tran_data.keys():
+                if var_name == 'time':
+                    continue  # Skip time axis
+
+                if len(tran_data[var_name]) == 0:
+                    continue  # Skip empty data
+
+                print(f"        {var_name} (transient)", end="")
+
+                try:
+                    from pipeline_ext.fit_transfer_function import fit_dynamic_transfer_function
+
+                    # Fit using ONLY transient data (no DC sweep)
+                    model = fit_dynamic_transfer_function(
+                        dc_x=None,  # No DC data available
+                        dc_y=None,
+                        transient_time=tran_data['time'],
+                        transient_voltage=tran_data[var_name],
+                        input_step_size=1.0  # Assume unit step
+                    )
+
+                    # Display metrics
+                    dc_gain = model['combined_params'].get('dc_gain')
+                    bandwidth = model['combined_params'].get('bandwidth')
+                    dc_gain_source = model['combined_params'].get('dc_gain_source')
+
+                    source_tag = f"[{dc_gain_source}]" if dc_gain_source == 'transient' else ""
+
+                    if dc_gain is not None and bandwidth is not None:
+                        print(f" → dynamic (gain={dc_gain:.2f}{source_tag}, BW={bandwidth/1e6:.1f}MHz)")
+                    elif dc_gain is not None:
+                        print(f" → dynamic (gain={dc_gain:.2f}{source_tag})")
+                    else:
+                        print(f" → insufficient data")
+                        continue
+
+                    # Add to fitted models with actual input name from block
+                    fitted_models.append({
+                        'input': input_name,  # Use actual control axes, not hardcoded 'transient'
+                        'output': var_name,
+                        'model': model,
+                        'data': {
+                            'time': tran_data['time'],
+                            'voltage': tran_data[var_name]
+                        }
+                    })
+
+                except Exception as e:
+                    print(f" → Failed: {e}")
 
     # Structural linear models (passive-only, from AC sweep)
     print("      Structural linear (AC frequency response):")
@@ -406,13 +652,17 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
     # Small-signal models (linear blocks)
     print("      Small-signal (linear blocks):")
     for ss_result in small_signal_results:
+        extraction_method = ss_result.get('extraction_method', 'OP')
+        method_tag = f" [{extraction_method}]" if extraction_method == 'transient' else ""
+
         for device_name, ac_params in ss_result['ac_params'].items():
-            print(f"        {device_name}: gm={ac_params['gm']:.2e}, gds={ac_params['gds']:.2e}")
+            print(f"        {device_name}: gm={ac_params['gm']:.2e}, gds={ac_params['gds']:.2e}{method_tag}")
 
             # Create small-signal model
             model = extract_small_signal_model(ac_params)
             model['model_type'] = 'small_signal'  # Add model_type for Verilog generator
             model['intent'] = 'linear'
+            model['extraction_method'] = extraction_method  # Track which method was used
 
             fitted_models.append({
                 'input': device_name,  # Device name
@@ -526,10 +776,26 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
         is_small_signal = (model_type == 'small_signal' or
                           fitted_model['output'] == 'small_signal')
 
-        # Detect if this is a dynamic/oscillator model
-        intent = fitted_model.get('model', {}).get('intent', '')
-        is_dynamic = any(keyword in module_name.lower() or keyword in intent.lower()
-                        for keyword in ['oscillator', 'vco', 'clock', 'ring'])
+        # Determine validation mode based on what data is available in the model
+        model_data = fitted_model.get('data', {})
+        has_dc_data = 'x' in model_data or 'x1' in model_data  # DC sweep data
+        has_transient_data = 'time' in model_data or 'voltage' in model_data  # Transient data
+
+        # Use transient mode if:
+        # 1. Model has transient data but no DC data (transient-only fallback)
+        # 2. Model has both but was built from transient (check model type)
+        # 3. Model is an oscillator (autonomous, no DC sweep possible)
+        model_type = fitted_model.get('model', {}).get('model_type', '')
+        is_oscillator = model_type == 'oscillator'
+
+        if has_transient_data and not has_dc_data:
+            validation_mode = 'transient'
+        elif is_oscillator:
+            validation_mode = 'transient'
+        elif has_dc_data:
+            validation_mode = 'auto'  # OSDI will try DC first
+        else:
+            validation_mode = 'auto'  # Let OSDI decide
 
         # Only run OSDI check if available and not a small-signal model
         if OSDI_AVAILABLE:
@@ -545,27 +811,98 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
                       f"(gm={gm:.2e} S, gds={gds:.2e} S) - parameter validation only")
             else:
                 try:
-                    # Auto-detect validation mode (DC vs transient)
-                    mode = 'transient' if is_dynamic else 'auto'
+                    # Use oscillator-specific checker for oscillator models
+                    if is_oscillator and OSCILLATOR_CHECKER_AVAILABLE:
+                        # Use frequency-domain oscillator equivalence checker
+                        import numpy as np
 
-                    result = osdi_checker.check_equivalence(
-                        netlist_text, code, module_name,
-                        input_names=input_names,
-                        output_names=[output_name],
-                        n_test_points=20,
-                        mode=mode
-                    )
-                    equivalence_results.append({
-                        'module': module_name,
-                        'result': result
-                    })
+                        # Run SPICE transient simulation
+                        spice_data = osdi_checker._run_transient_spice(
+                            netlist_text, [output_name], 30e-9, 100e-12
+                        )
 
-                    # Add mode indicator to status
-                    mode_indicator = '⏱' if mode == 'transient' else ''
-                    status = "✓" if result.passed else "✗"
-                    print(f"      {status} {mode_indicator} {module_name}: " +
-                          f"max_err={result.max_absolute_error:.2e}, " +
-                          f"corr={result.correlation:.3f}")
+                        if spice_data and output_name in spice_data:
+                            spice_time = np.array(spice_data['time'])
+                            spice_voltage = np.array(spice_data[output_name])
+
+                            # Extract parameters from VA model
+                            import re
+                            freq_match = re.search(r'parameter real frequency = ([0-9.e+-]+)', code)
+                            amp_match = re.search(r'parameter real amplitude = ([0-9.e+-]+)', code)
+                            offset_match = re.search(r'parameter real offset = ([0-9.e+-]+)', code)
+
+                            if freq_match and amp_match and offset_match:
+                                expected_freq = float(freq_match.group(1))
+                                expected_amp = float(amp_match.group(1))
+                                expected_offset = float(offset_match.group(1))
+
+                                # Generate VA model waveform
+                                vams_voltage = expected_offset + expected_amp * np.sin(
+                                    2 * np.pi * expected_freq * spice_time
+                                )
+
+                                # Check oscillator equivalence with frequency-domain metrics
+                                osc_result = check_oscillator_equivalence(
+                                    spice_time, spice_voltage,
+                                    spice_time, vams_voltage,
+                                    freq_tol=0.05,  # 5% frequency tolerance
+                                    amp_tol=0.10,   # 10% amplitude tolerance
+                                    offset_tol=0.5  # 500mV offset tolerance (relaxed for context-dependent DC bias)
+                                )
+
+                                # Create compatible result object for reporting
+                                class OscEquivResult:
+                                    def __init__(self, osc_res):
+                                        self.passed = osc_res.passed
+                                        self.max_absolute_error = osc_res.frequency_error
+                                        self.correlation = 1.0 - (osc_res.amplitude_error_pct / 100.0)
+
+                                result = OscEquivResult(osc_result)
+                                equivalence_results.append({
+                                    'module': module_name,
+                                    'result': result,
+                                    'oscillator_metrics': {
+                                        'freq_error_pct': osc_result.frequency_error_pct,
+                                        'amp_error_pct': osc_result.amplitude_error_pct,
+                                        'offset_error': osc_result.offset_error
+                                    }
+                                })
+
+                                status = "✓" if result.passed else "✗"
+                                print(f"      {status} 🔄 {module_name} (oscillator, freq-domain): " +
+                                      f"freq_err={osc_result.frequency_error_pct:.2f}%, " +
+                                      f"amp_err={osc_result.amplitude_error_pct:.2f}%")
+                            else:
+                                print(f"      ⚠ {module_name}: could not extract oscillator parameters from VA model")
+                        else:
+                            print(f"      ⚠ {module_name}: oscillator SPICE simulation failed")
+                    else:
+                        # Use regular OSDI checker for non-oscillator models
+                        mode_desc = f" (using {validation_mode} mode)" if validation_mode == 'transient' else ""
+
+                        result = osdi_checker.check_equivalence(
+                            netlist_text, code, module_name,
+                            input_names=input_names,
+                            output_names=[output_name],
+                            n_test_points=20,
+                            mode=validation_mode
+                        )
+                        equivalence_results.append({
+                            'module': module_name,
+                            'result': result
+                        })
+
+                        # Add mode indicator to status
+                        mode_indicator = '⏱' if validation_mode == 'transient' else ''
+                        status = "✓" if result.passed else "✗"
+
+                        # Handle None values from skipped checks
+                        if result.max_absolute_error is not None and result.correlation is not None:
+                            print(f"      {status} {mode_indicator} {module_name}{mode_desc}: " +
+                                  f"max_err={result.max_absolute_error:.2e}, " +
+                                  f"corr={result.correlation:.3f}")
+                        else:
+                            print(f"      {status} {mode_indicator} {module_name}{mode_desc}: validation skipped")
                 except Exception as e:
                     print(f"      ⚠ {module_name}: equivalence check failed ({e})")
 
