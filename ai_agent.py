@@ -17,37 +17,58 @@ import numpy as np
 
 SYSTEM_PROMPT = """\
 You are an expert analog circuit engineer specializing in Verilog-AMS behavioral modeling.
+Generate a Verilog-AMS (.va) file that replicates a circuit's transfer characteristic.
 
-Generate Verilog-AMS (.va) files that accurately replicate a circuit's transfer characteristic.
-
-Verilog-AMS rules:
+## Syntax rules
 - First line MUST be: `include "disciplines.vams"
-- When using `M_PI or `M_TWO_PI, also add: `include "constants.vams"
-- Module ports: (output electrical out, input electrical in)
-- Use: analog begin ... end
-- Assign output voltage: V(out) <+ <expression>;
-- Declare real variables with 'real' and constants with 'parameter real'
-- Model operating regions with if/else (e.g. off, linear, saturation)
+- When using laplace_nd or tau, also add: `include "constants.vams"
+- Module declaration ends with semicolon: module NAME (out, in);
+- Port declarations: electrical out, in;
+- Parameters: parameter real name = value;
+- Contribution: V(out) <+ expression;
+- Always clamp to rails: V(out) <+ min(voh, max(vol, expression));
 - No markdown fences — return pure .va code only
 
-When AC frequency response data is provided:
-- Generate a DYNAMIC behavioral model that captures bandwidth, not just DC gain.
-- Use laplace_nd() for a first-order lowpass with input bias offset:
-    parameter real vmid = (voh + vol) / 2.0;   // output midpoint
-    V(out) <+ min(voh, max(vol, vmid + gain * laplace_nd(V(in) - vth, {1.0}, {1.0, tau})));
-  where:
-    vth  = input threshold voltage (midpoint of S-curve, from Vth metric)
-    vmid = (voh + vol) / 2.0  (output midpoint)
-    tau  = 1.0 / (2.0 * `M_PI * 2.0 * bw_hz)  (RC time constant)
-- The bias offset V(in) - vth centres the linear amplification on the correct
-  operating point. Without it, gain * V(in) saturates for all biased circuits.
-- The laplace_nd(signal, num_coeffs, den_coeffs) function models H(s)=N(s)/D(s).
-  For H(s) = 1/(1+s*tau): num={1.0}, den={1.0, tau}."""
+## Example 1 — static model (no bandwidth data)
+
+`include "disciplines.vams"
+module DIFF_AMP (out, in);
+  electrical out, in;
+  parameter real voh  = 1.8;
+  parameter real vol  = 0.2;
+  parameter real vth  = 0.9;
+  parameter real gain = 8.0;
+  analog begin
+    V(out) <+ min(voh, max(vol, (voh+vol)/2.0 + gain * (V(in) - vth)));
+  end
+endmodule
+
+## Example 2 — dynamic model (when bandwidth / tau is provided)
+
+`include "disciplines.vams"
+`include "constants.vams"
+module CML_RX (out, in);
+  electrical out, in;
+  parameter real voh  = 1.8;
+  parameter real vol  = 1.0;
+  parameter real vth  = 0.9;
+  parameter real gain = 5.07;
+  parameter real tau  = 7.96e-10;
+  analog begin
+    V(out) <+ min(voh, max(vol, (voh+vol)/2.0 + gain * laplace_nd(V(in) - vth, {1.0}, {1.0, tau})));
+  end
+endmodule
+
+laplace_nd(signal, {num}, {den}) models H(s)=N(s)/D(s).
+For a first-order lowpass H(s)=1/(1+s*tau): use num={1.0}, den={1.0, tau}.
+(V(in) - vth) centres amplification on the correct bias point — never omit it."""
 
 
 # ── Prompt builders ────────────────────────────────────────────────────
 
 def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None):
+    import math as _math
+
     lines = [
         "Generate a Verilog-AMS behavioral model for the circuit below.",
         "",
@@ -55,6 +76,8 @@ def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None):
         netlist.strip(),
         "",
     ]
+
+    # DC sweep data table
     if x is not None and y is not None:
         lines += [
             f"## ngspice DC Sweep  "
@@ -65,6 +88,8 @@ def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None):
         idx = np.round(np.linspace(0, len(x) - 1, min(20, len(x)))).astype(int)
         for i in idx:
             lines.append(f"{x[i]:>10.4f}  {y[i]:>10.4f}")
+
+    # DC metrics
     if metrics is not None:
         lines += [
             "",
@@ -74,6 +99,8 @@ def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None):
             f"  Vth  (input threshold)     = {metrics['vth']:.4f} V",
             f"  Gain (peak |dVout/dVin|)   = {metrics['gain']:.2f} V/V",
         ]
+
+    # AC Bode data
     if ac_metrics is not None:
         freqs  = ac_metrics['frequencies']
         mag_db = ac_metrics['magnitude_db']
@@ -84,37 +111,97 @@ def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None):
             f"{'Frequency (Hz)':>16}  {'Gain (dB)':>10}  {'Phase (°)':>10}",
             "─" * 42,
         ]
-        idx_ac = np.round(np.linspace(0, len(freqs) - 1,
-                                      min(20, len(freqs)))).astype(int)
+        idx_ac = np.round(
+            np.linspace(0, len(freqs) - 1, min(20, len(freqs)))
+        ).astype(int)
         for i in idx_ac:
             lines.append(
                 f"{float(freqs[i]):>16.3e}  "
                 f"{float(mag_db[i]):>10.2f}  "
                 f"{float(phases[i]):>10.1f}"
             )
-        lines += ["",
-                  f"  DC gain  = {ac_metrics['dc_gain_db']:.2f} dB"
-                  f"  ({ac_metrics['dc_gain_linear']:.1f} V/V)"]
-        if ac_metrics['bw_3db_hz']:
-            import math as _math
+        lines += [
+            "",
+            f"  DC gain = {ac_metrics['dc_gain_db']:.2f} dB"
+            f"  ({ac_metrics['dc_gain_linear']:.1f} V/V)",
+        ]
+        if ac_metrics.get('bw_3db_hz'):
             tau = 1.0 / (2.0 * _math.pi * ac_metrics['bw_3db_hz'])
             lines += [
-                f"  -3dB BW  = {ac_metrics['bw_3db_hz'] / 1e6:.3f} MHz",
-                f"  tau      = {tau * 1e9:.3f} ns  "
-                f"(use as the denominator coefficient in laplace_nd)",
-                "",
-                "Use laplace_nd with input bias offset (vth from metrics above):",
-                "  parameter real vmid = (voh + vol) / 2.0;",
-                "  V(out) <+ min(voh, max(vol, vmid + gain * laplace_nd(V(in) - vth, {1.0}, {1.0, tau})));",
-                "  // V(in) - vth centres amplification on the operating point",
+                f"  -3dB BW = {ac_metrics['bw_3db_hz'] / 1e6:.3f} MHz",
+                f"  tau     = {tau * 1e9:.4f} ns",
             ]
-    lines += [
-        "",
-        f"Signal input: source={info['signal_source']}, "
-        f"output node='{info['output_node']}', VDD={info['vdd']} V",
-        "",
-        "Generate the Verilog-AMS module:",
-    ]
+
+    # ── Pre-filled skeleton ──────────────────────────────────────────────
+    # When we have simulation-derived parameters, give the LLM a skeleton
+    # with every parameter pre-computed.  It only needs to write the single
+    # V(out) contribution line — reducing failure surface dramatically.
+    if metrics is not None:
+        voh  = metrics['voh']
+        vol  = metrics['vol']
+        vth  = metrics['vth']
+        gain = metrics['gain']
+
+        tau_val = None
+        if ac_metrics is not None and ac_metrics.get('bw_3db_hz'):
+            tau_val = 1.0 / (2.0 * _math.pi * ac_metrics['bw_3db_hz'])
+
+        has_tau = tau_val is not None
+        vmid    = (voh + vol) / 2.0
+
+        skel = [
+            "",
+            "## Pre-filled skeleton — complete the V(out) line inside analog begin",
+            "",
+            '`include "disciplines.vams"',
+        ]
+        if has_tau:
+            skel.append('`include "constants.vams"')
+        skel += [
+            "module BEHAVIORAL_MODEL (out, in);",
+            "  electrical out, in;",
+            f"  parameter real voh  = {voh:.4f};   // output high rail",
+            f"  parameter real vol  = {vol:.4f};   // output low rail",
+            f"  parameter real vth  = {vth:.4f};   // input threshold",
+            f"  parameter real gain = {gain:.4f};  // peak small-signal gain (V/V)",
+        ]
+        if has_tau:
+            skel.append(
+                f"  parameter real tau  = {tau_val:.4e};  "
+                f"// time constant = 1/(2π×{ac_metrics['bw_3db_hz']/1e6:.1f}MHz)"
+            )
+        skel += [
+            "  analog begin",
+            "    // Fill in exactly one line:",
+        ]
+        if has_tau:
+            skel += [
+                f"    //   vmid = {vmid:.4f} = (voh+vol)/2",
+                "    V(out) <+ min(voh, max(vol, (voh+vol)/2.0"
+                " + gain * laplace_nd(V(in) - vth, {1.0}, {1.0, tau})));",
+            ]
+        else:
+            skel += [
+                f"    //   vmid = {vmid:.4f} = (voh+vol)/2",
+                "    V(out) <+ min(voh, max(vol, (voh+vol)/2.0"
+                " + gain * (V(in) - vth)));",
+            ]
+        skel += [
+            "  end",
+            "endmodule",
+            "",
+            "Return the complete module above with the V(out) line confirmed or corrected.",
+        ]
+        lines += skel
+    else:
+        lines += [
+            "",
+            f"Signal input: source={info['signal_source']}, "
+            f"output node='{info['output_node']}', VDD={info['vdd']} V",
+            "",
+            "Generate the Verilog-AMS module:",
+        ]
+
     return "\n".join(lines)
 
 
