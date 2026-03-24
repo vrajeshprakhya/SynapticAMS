@@ -993,6 +993,7 @@ def run_pipeline(netlist_text, output_dir=".",
     print(f"      model  : {va_path}")
 
     if x is not None and y is not None:
+        np.savez(out / "sweep_data.npz", x=x, y=y)
         plot_path = _save_plots(output_dir, x, y, info, ac_metrics)
         if plot_path:
             print(f"      plots  : {plot_path}")
