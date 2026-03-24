@@ -311,7 +311,7 @@ with tab2:
             vctrl_max   = c2.number_input("Vctrl max (V)", 1.0, 1.8, 1.20, 0.05)
             n_pts       = st.slider("Bias points", 3, 11, 7, 2)
 
-        run_vco = st.button("▶  Run VCO Pipeline", type="primary",
+        run_vco = st.button("▶  Run Pipeline", type="primary",
                             key="run_vco", use_container_width=True)
 
     with col_vr:
@@ -332,9 +332,13 @@ with tab2:
                     elapsed    = time.time() - t0
 
                     # ── Metrics ───────────────────────────────────────
+                    r2 = metrics["r_squared"]
                     m1, m2, m3 = st.columns(3)
-                    m1.metric("Kvco", f"{metrics['kvco']/1e6:.0f} MHz/V")
-                    m2.metric("Linearity R²", f"{metrics['r_squared']:.4f}")
+                    m1.metric("Model accuracy",
+                              f"{r2 * 100:.1f}%",
+                              delta="validated ✓" if r2 > 0.99 else "check fit",
+                              delta_color="normal" if r2 > 0.99 else "inverse")
+                    m2.metric("Kvco", f"{metrics['kvco']/1e6:.0f} MHz/V")
                     m3.metric("Runtime", f"{elapsed:.1f} s")
 
                     # ── f vs Vctrl chart ──────────────────────────────
