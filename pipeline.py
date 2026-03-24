@@ -1024,19 +1024,33 @@ VDD vdd 0 DC 1.8
 Vin vin 0 DC 0
 .model NMOS NMOS (LEVEL=1 VTO=0.4 KP=100u LAMBDA=0.02)
 """
-    if len(sys.argv) > 1:
-        netlist_path = Path(sys.argv[1])
+    args = sys.argv[1:]
+    vco_mode = "--vco" in args
+    pos_args = [a for a in args if not a.startswith("--")]
+
+    if pos_args:
+        netlist_path = Path(pos_args[0])
         if not netlist_path.exists():
             print(f"Error: file not found: {netlist_path}", file=sys.stderr)
             sys.exit(1)
-        NETLIST = netlist_path.read_text()
+        NETLIST    = netlist_path.read_text()
         output_dir = str(netlist_path.parent / (netlist_path.stem + "_output"))
-        va_path, nrmse = run_pipeline(NETLIST, output_dir=output_dir)
+        if vco_mode:
+            va_path, _ = run_vco_pipeline(NETLIST, output_dir=output_dir)
+        else:
+            va_path, _ = run_pipeline(NETLIST, output_dir=output_dir)
     else:
-        NETLIST = _DEFAULT_NETLIST
-        with tempfile.TemporaryDirectory() as tmp:
-            va_path, nrmse = run_pipeline(NETLIST, output_dir=tmp)
-            print(f"\n{'=' * 68}")
-            print(" GENERATED VERILOG-AMS:")
-            print("=" * 68)
-            print(va_path.read_text())
+        if vco_mode:
+            vco_path = Path("examples/netlists/vco_ring5.cir")
+            NETLIST  = vco_path.read_text() if vco_path.exists() else _DEFAULT_NETLIST
+            with tempfile.TemporaryDirectory() as tmp:
+                va_path, metrics = run_vco_pipeline(NETLIST, output_dir=tmp)
+                print(va_path.read_text())
+        else:
+            NETLIST = _DEFAULT_NETLIST
+            with tempfile.TemporaryDirectory() as tmp:
+                va_path, _ = run_pipeline(NETLIST, output_dir=tmp)
+                print(f"\n{'=' * 68}")
+                print(" GENERATED VERILOG-AMS:")
+                print("=" * 68)
+                print(va_path.read_text())
