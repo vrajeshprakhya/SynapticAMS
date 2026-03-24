@@ -1,0 +1,88 @@
+* 5-Stage Current-Starved Ring VCO
+* ================================================================
+* Level-1 MOSFET, 1.8V supply, no external PDK required.
+* Matches the same model file used in serdes_cml.cir.
+*
+* Topology: current-starved inverter chain (5 stages)
+*   Each stage: PMOS pull-up (unconstrained) + NMOS driver + NMOS
+*   current sink (gate = Vctrl) that limits discharge current.
+*   Pull-up is fast; discharge speed is set by Mn_cs → Vctrl
+*   controls oscillation frequency.
+*
+* Characterisation range:
+*   Vctrl = 0.60 V → f_osc ≈  80 MHz  (Ids_cs ≈  20 µA)
+*   Vctrl = 0.90 V → f_osc ≈ 160 MHz  (Ids_cs ≈  81 µA)
+*   Vctrl = 1.20 V → f_osc ≈ 280 MHz  (Ids_cs ≈ 180 µA)
+*   Kvco  ≈ 330 MHz/V  (linear approximation)
+*   tau_vco = 1/(2π × Kvco × Kpd/N) — set by PLL loop filter
+*
+* Usage in SynapticAMS pipeline:
+*   run_vco_pipeline('vco_ring5.cir') sweeps Vctrl via .TRAN,
+*   extracts period at each bias, fits Kvco, generates Verilog-AMS.
+*
+* Standalone test (runs 200 ns transient at Vctrl=0.9V):
+*   ngspice examples/netlists/vco_ring5.cir
+* ================================================================
+
+* ── MOSFET Models (Level 1, same as serdes_cml.cir) ──────────────
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.45 KP=200u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+.MODEL PMOS PMOS (LEVEL=1 VTO=-0.45 KP=100u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+
+* ── Supply & control voltage ────────────────────────────────────
+VDD  vdd  0  DC 1.8
+* Vctrl is the PLL loop-filter output voltage.
+* Sweep this from 0.6→1.2 V in run_vco_pipeline() to extract Kvco.
+Vctrl ctrl 0  DC 0.9
+
+* ── Current-starved inverter stages ────────────────────────────
+* Each stage:
+*   Mp  : PMOS pull-up  (W/L = 8u/0.18u, fast charge)
+*   Mn  : NMOS driver   (W/L = 4u/0.18u)
+*   Mcs : NMOS current sink (W/L = 4u/1u, long channel → current source)
+*         Gate = Vctrl → Ids_cs = 0.5·KP·(W/L)·(Vctrl−Vth)²
+*   C   : Node capacitance sets baseline delay (200 fF each)
+*
+* Stage 1: in = n5 (ring close), out = n1
+Mp1  n1  n5   vdd vdd  PMOS  W=8u  L=0.18u
+Mn1  n1  n5   x1  0    NMOS  W=4u  L=0.18u
+Mcs1 x1  ctrl 0   0    NMOS  W=4u  L=1u
+C1   n1  0    200f
+
+* Stage 2: in = n1, out = n2
+Mp2  n2  n1   vdd vdd  PMOS  W=8u  L=0.18u
+Mn2  n2  n1   x2  0    NMOS  W=4u  L=0.18u
+Mcs2 x2  ctrl 0   0    NMOS  W=4u  L=1u
+C2   n2  0    200f
+
+* Stage 3: in = n2, out = n3
+Mp3  n3  n2   vdd vdd  PMOS  W=8u  L=0.18u
+Mn3  n3  n2   x3  0    NMOS  W=4u  L=0.18u
+Mcs3 x3  ctrl 0   0    NMOS  W=4u  L=1u
+C3   n3  0    200f
+
+* Stage 4: in = n3, out = n4
+Mp4  n4  n3   vdd vdd  PMOS  W=8u  L=0.18u
+Mn4  n4  n3   x4  0    NMOS  W=4u  L=0.18u
+Mcs4 x4  ctrl 0   0    NMOS  W=4u  L=1u
+C4   n4  0    200f
+
+* Stage 5: in = n4, out = n5  (feeds back to stage 1)
+Mp5  n5  n4   vdd vdd  PMOS  W=8u  L=0.18u
+Mn5  n5  n4   x5  0    NMOS  W=4u  L=0.18u
+Mcs5 x5  ctrl 0   0    NMOS  W=4u  L=1u
+C5   n5  0    200f
+
+* ── Output buffer (drives vout) ───────────────────────────────
+* Isolates ring from load; vout is observed by the pipeline.
+Mbuf_p  vout  n5  vdd  vdd  PMOS  W=16u  L=0.18u
+Mbuf_n  vout  n5  0    0    NMOS  W=8u   L=0.18u
+Cbuf    vout  0   100f
+
+* ── Initial conditions (break symmetry to start oscillation) ──
+.IC V(n1)=1.8 V(n2)=0 V(n3)=1.8 V(n4)=0 V(n5)=1.8
+
+* ── Transient analysis (standalone test: 200 ns @ Vctrl=0.9 V) ─
+* The pipeline replaces Vctrl and reruns .TRAN for each bias point.
+.TRAN 50p 200n
+
+.END

@@ -673,6 +673,170 @@ def _save_plots(output_dir, x_dc, y_dc, info, ac_metrics):
         plt.close()
 
 
+# ── VCO characterization ───────────────────────────────────────────────
+
+def _extract_vco_freq(t, v):
+    """
+    Extract oscillation frequency from a transient waveform by counting
+    rising-edge crossings through the signal midpoint.
+    Returns frequency in Hz, or None if fewer than 3 crossings found.
+    """
+    mid = (float(v.max()) + float(v.min())) / 2.0
+    rising = (v[:-1] < mid) & (v[1:] >= mid)
+    cross_times = t[1:][rising]
+    if len(cross_times) < 3:
+        return None
+    period = (cross_times[-1] - cross_times[0]) / (len(cross_times) - 1)
+    return float(1.0 / period)
+
+
+def _fit_vco_kvco(vctrl_arr, freq_arr):
+    """
+    Fit a linear Kvco model to measured (Vctrl, f_osc) pairs.
+    Returns dict with kvco, f_intercept, vctrl_ref, f_ref, r_squared.
+    """
+    coeffs = np.polyfit(vctrl_arr, freq_arr, 1)
+    kvco       = float(coeffs[0])   # Hz/V
+    f_intercept = float(coeffs[1])  # Hz (linear extrapolation to Vctrl=0)
+
+    # Reference point at the measured midrange (cleaner than extrapolated intercept)
+    mid_idx    = len(vctrl_arr) // 2
+    vctrl_ref  = float(vctrl_arr[mid_idx])
+    f_ref      = float(freq_arr[mid_idx])
+
+    f_pred = np.polyval(coeffs, vctrl_arr)
+    ss_res = float(np.sum((freq_arr - f_pred) ** 2))
+    ss_tot = float(np.sum((freq_arr - freq_arr.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+
+    return {
+        'vctrl':       vctrl_arr,
+        'frequencies': freq_arr,
+        'kvco':        kvco,
+        'f_intercept': f_intercept,
+        'vctrl_ref':   vctrl_ref,
+        'f_ref':       f_ref,
+        'r_squared':   r2,
+    }
+
+
+def vco_tran_sweep(netlist_text, ctrl_source='Vctrl', output_node='vout',
+                   vctrl_values=None, tstep=50e-12, tstop=200e-9):
+    """
+    Characterize a ring VCO by running ngspice .TRAN at each Vctrl bias.
+
+    For each Vctrl value the transient waveform is captured, rising-edge
+    crossings are counted, and the oscillation frequency is extracted.
+    A linear Kvco model is then fitted to the (Vctrl, f_osc) pairs.
+
+    Args:
+        netlist_text:  SPICE netlist string (must contain a .TRAN directive
+                       and an .IC to start oscillation)
+        ctrl_source:   Name of the DC voltage source that sets Vctrl
+        output_node:   Node to observe (buffer output of VCO)
+        vctrl_values:  Sequence of Vctrl values to sweep (V).
+                       Defaults to 7 points from 0.70 V to 1.20 V.
+        tstep:         Transient time step (s)
+        tstop:         Transient stop time (s)
+
+    Returns:
+        dict with keys: vctrl, frequencies, kvco, f_intercept,
+                        vctrl_ref, f_ref, r_squared
+    """
+    from ngspice_runner import NgspiceRunner
+    if vctrl_values is None:
+        vctrl_values = np.linspace(0.70, 1.20, 7)
+
+    runner = NgspiceRunner()
+    valid_vctrl, valid_freq = [], []
+
+    print(f"\n[VCO sweep] {len(vctrl_values)} Vctrl points via .TRAN ...")
+    for vc in vctrl_values:
+        try:
+            result = runner.tran_sweep(netlist_text, {
+                'tstep':         tstep,
+                'tstop':         tstop,
+                'signal_source': ctrl_source,
+                'observe':       [output_node],
+                'v_low':         vc,
+                'v_high':        vc,
+            })
+            t = result['time']
+            v = result[output_node]
+            freq = _extract_vco_freq(t, v)
+            if freq is not None:
+                valid_vctrl.append(vc)
+                valid_freq.append(freq)
+                print(f"  Vctrl={vc:.2f} V → {freq / 1e6:.1f} MHz")
+            else:
+                print(f"  Vctrl={vc:.2f} V → not oscillating (skipped)")
+        except Exception as exc:
+            print(f"  Vctrl={vc:.2f} V → error: {exc} (skipped)")
+
+    if len(valid_vctrl) < 2:
+        raise RuntimeError(
+            "VCO sweep: fewer than 2 valid operating points — "
+            "circuit may not be oscillating. Check .IC and Vctrl range."
+        )
+
+    metrics = _fit_vco_kvco(np.array(valid_vctrl), np.array(valid_freq))
+    print(f"  Kvco = {metrics['kvco'] / 1e6:.1f} MHz/V  "
+          f"f_ref = {metrics['f_ref'] / 1e6:.1f} MHz @ "
+          f"Vctrl={metrics['vctrl_ref']:.2f} V  "
+          f"R²={metrics['r_squared']:.4f}")
+    return metrics
+
+
+def run_vco_pipeline(netlist_text, output_dir=".",
+                     ctrl_source='Vctrl', output_node='vout',
+                     vctrl_range=(0.70, 1.20), n_points=7):
+    """
+    Full VCO characterization pipeline:
+      [1/3] .TRAN sweep — extract f_osc at each Vctrl bias
+      [2/3] Fit linear Kvco model
+      [3/3] Generate + save Verilog-AMS behavioral model
+
+    Returns:
+        (va_path: Path, vco_metrics: dict)
+    """
+    from ai_agent import generate_vco_va
+
+    print("=" * 68)
+    print(" VCO CHARACTERIZATION PIPELINE")
+    print("=" * 68)
+
+    vctrl_vals = np.linspace(vctrl_range[0], vctrl_range[1], n_points)
+
+    print("\n[1/3] Transient sweep — measuring oscillation frequency ...")
+    vco_metrics = vco_tran_sweep(
+        netlist_text,
+        ctrl_source=ctrl_source,
+        output_node=output_node,
+        vctrl_values=vctrl_vals,
+    )
+
+    print("\n[2/3] Fitting Kvco model ...")
+    print(f"      Kvco     = {vco_metrics['kvco'] / 1e6:.2f} MHz/V")
+    print(f"      f_ref    = {vco_metrics['f_ref'] / 1e6:.2f} MHz")
+    print(f"      Vctrl_ref = {vco_metrics['vctrl_ref']:.3f} V")
+    print(f"      R²        = {vco_metrics['r_squared']:.4f}")
+
+    print("\n[3/3] Generating Verilog-AMS ...")
+    va_code = generate_vco_va(vco_metrics)
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    va_path = out / "vco_model.va"
+    va_path.write_text(va_code)
+    print(f"      saved  : {va_path}")
+
+    print(f"\n{'=' * 68}")
+    print(f" DONE — VCO modeled as Kvco={vco_metrics['kvco']/1e6:.1f} MHz/V")
+    print("=" * 68)
+
+    return va_path, vco_metrics
+
+
 def _is_dynamic_model(va_code):
     """
     Return True if va_code uses time-domain or frequency-domain constructs
