@@ -904,6 +904,111 @@ def _classify_waveform_shape(time, voltage, analysis):
 
 
 # ============================================================
+# Dynamic Transfer Function Fitting (DC + Transient combined)
+# ============================================================
+
+def fit_dynamic_transfer_function(dc_x, dc_y, transient_time, transient_voltage,
+                                   input_step_size=1.0):
+    """
+    Fit a dynamic (AC/transient) transfer function combining DC sweep data and
+    transient simulation data.
+
+    Args:
+        dc_x:               1D array of DC sweep input values (or None)
+        dc_y:               1D array of DC sweep output values (or None)
+        transient_time:     1D array of time points from transient sim
+        transient_voltage:  1D array of voltage samples from transient sim
+        input_step_size:    Magnitude of the input step used in transient sim
+
+    Returns:
+        dict: {
+            'model_type': 'dynamic',
+            'intent': 'dynamic',
+            'dc_model': dict or None,
+            'oscillator': dict or None,
+            'combined_params': {
+                'dc_gain': float or None,
+                'bandwidth': float or None,  # Hz
+                'dc_gain_source': 'dc_sweep' or 'transient',
+                'frequency': float or None,  # Hz (for oscillators)
+                'amplitude': float or None,
+            }
+        }
+    """
+    combined_params = {
+        'dc_gain': None,
+        'bandwidth': None,
+        'dc_gain_source': None,
+        'frequency': None,
+        'amplitude': None,
+    }
+
+    dc_model = None
+    oscillator_info = None
+
+    # --- Step 1: DC gain from sweep data ---
+    if dc_x is not None and dc_y is not None and len(dc_x) > 1:
+        try:
+            dc_model = fit_transfer_function(dc_x, dc_y)
+            # Estimate DC gain as peak |dVout/dVin|
+            dy = np.gradient(dc_y, dc_x)
+            combined_params['dc_gain'] = float(np.max(np.abs(dy)))
+            combined_params['dc_gain_source'] = 'dc_sweep'
+        except Exception:
+            pass
+
+    # --- Step 2: Analyze transient waveform ---
+    t = np.asarray(transient_time, dtype=float)
+    v = np.asarray(transient_voltage, dtype=float)
+
+    if len(t) >= 10 and len(v) >= 10:
+        osc = analyze_oscillator_waveform(t, v)
+
+        if osc['is_oscillating']:
+            oscillator_info = osc
+            combined_params['frequency'] = osc['frequency']
+            combined_params['amplitude'] = osc['amplitude']
+            # For oscillators, DC gain from transient peak-to-peak / input_step
+            if combined_params['dc_gain'] is None:
+                pp = osc['amplitude'] * 2
+                combined_params['dc_gain'] = pp / (input_step_size + 1e-12)
+                combined_params['dc_gain_source'] = 'transient'
+        else:
+            # Step-response: estimate bandwidth from 10-90% rise time
+            try:
+                v_min = np.min(v)
+                v_max = np.max(v)
+                v_range = v_max - v_min
+                if v_range > 1e-9:
+                    v10 = v_min + 0.10 * v_range
+                    v90 = v_min + 0.90 * v_range
+                    idx10 = np.where(v >= v10)[0]
+                    idx90 = np.where(v >= v90)[0]
+                    if len(idx10) and len(idx90):
+                        t10 = t[idx10[0]]
+                        t90 = t[idx90[0]]
+                        rise_time = abs(t90 - t10)
+                        if rise_time > 0:
+                            # BW ≈ 0.35 / rise_time (standard approximation)
+                            combined_params['bandwidth'] = 0.35 / rise_time
+                # DC gain from step response steady-state
+                if combined_params['dc_gain'] is None:
+                    steady_state = np.mean(v[-max(1, len(v) // 10):])
+                    combined_params['dc_gain'] = abs(steady_state) / (input_step_size + 1e-12)
+                    combined_params['dc_gain_source'] = 'transient'
+            except Exception:
+                pass
+
+    return {
+        'model_type': 'dynamic',
+        'intent': 'dynamic',
+        'dc_model': dc_model,
+        'oscillator': oscillator_info,
+        'combined_params': combined_params,
+    }
+
+
+# ============================================================
 # Example
 # ============================================================
 

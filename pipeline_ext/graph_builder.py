@@ -19,9 +19,21 @@ DEVICE_TERMINALS = {
 # ----------------------------------------
 def parse_spice_netlist(netlist_text):
     devices = []
+    in_control = False
 
     for line in netlist_text.splitlines():
         line = line.strip()
+
+        # Track .control/.endc blocks and skip their contents
+        upper = line.upper()
+        if upper.startswith(".CONTROL"):
+            in_control = True
+            continue
+        if upper.startswith(".ENDC"):
+            in_control = False
+            continue
+        if in_control:
+            continue
 
         # Skip comments and control lines
         if not line or line.startswith("*") or line.startswith("."):

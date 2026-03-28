@@ -88,41 +88,55 @@ def detect_capabilities() -> dict:
               fail_detail="not found on PATH — all simulations will be skipped",
               required=True)
 
-    # ── ngspice OSDI support (.osdi directive) ────────────────────────────────
-    osdi_test = subprocess.run(
-        ["ngspice", "-b"],
-        input=".title osdi_probe\n.osdi /dev/null\n.end\n",
-        capture_output=True, text=True
-    )
-    osdi_ngspice = "unimplemented" not in osdi_test.stderr.lower()
+    # ── ngspice OSDI support ──────────────────────────────────────────────────
+    # OSDI is loaded via 'osdi /path/model.osdi' inside a .control block.
+    # A custom OSDI-enabled binary is at ~/.local/bin/ngspice-osdi (built from
+    # source with ./configure --enable-osdi).  The Homebrew bottle lacks this.
+    OSDI_NGSPICE_BIN = str(Path.home() / ".local" / "bin" / "ngspice-osdi")
+    osdi_bin_exists = Path(OSDI_NGSPICE_BIN).exists()
+    if osdi_bin_exists:
+        osdi_test = subprocess.run(
+            [OSDI_NGSPICE_BIN, "-b"],
+            input=".title osdi_probe\n.control\nosdi /dev/null\n.endc\n.end\n",
+            capture_output=True, text=True
+        )
+        # 'osdi' command recognized → no "unimplemented" error (dlopen failure is fine)
+        osdi_ngspice = "unimplemented dot command" not in osdi_test.stderr.lower()
+    else:
+        osdi_ngspice = False
     caps["ngspice_osdi"] = osdi_ngspice
+    caps["osdi_ngspice_bin"] = OSDI_NGSPICE_BIN if osdi_ngspice else "ngspice"
     _cap_line(
-        "ngspice OSDI support (.osdi directive)",
+        "ngspice OSDI support (osdi command in .control)",
         osdi_ngspice,
-        ok_detail="ngspice compiled with --enable-osdi",
+        ok_detail=f"OSDI-enabled binary at {OSDI_NGSPICE_BIN}",
         fail_detail=(
-            "ngspice compiled WITHOUT --enable-osdi  "
-            "(Homebrew bottle does not include it). "
-            "Fix: brew uninstall ngspice && brew install ngspice --HEAD "
-            "--with-osdi  OR  compile from source with ./configure --enable-osdi"
+            f"OSDI-enabled ngspice not found at {OSDI_NGSPICE_BIN}. "
+            "The Homebrew bottle lacks --enable-osdi. "
+            "Build: download ngspice source, ./configure --enable-osdi, make. "
+            "Copy binary to ~/.local/bin/ngspice-osdi."
         ),
     )
 
     # ── OpenVAF ──────────────────────────────────────────────────────────────
-    openvaf_bin = subprocess.run(
-        ["which", "openvaf"], capture_output=True, text=True
-    ).stdout.strip()
+    # Check both PATH and ~/.local/bin (where cargo installs to)
+    openvaf_bin = (
+        subprocess.run(["which", "openvaf"], capture_output=True, text=True).stdout.strip()
+        or (str(Path.home() / ".local" / "bin" / "openvaf")
+            if (Path.home() / ".local" / "bin" / "openvaf").exists() else "")
+    )
     caps["openvaf"] = bool(openvaf_bin)
+    caps["openvaf_bin"] = openvaf_bin or "openvaf"
     _cap_line(
         "openvaf binary",
         caps["openvaf"],
         ok_detail=openvaf_bin,
         fail_detail=(
-            "not found on PATH. "
-            "No pre-built macOS ARM64 binary exists (last release v23.5.0 had no assets). "
-            "To build from source: install Rust via rustup, then "
-            "'cargo install --git https://github.com/pascalkuthe/OpenVAF'. "
-            "Also requires LLVM 14+ ('brew install llvm')."
+            "not found. Building from source: "
+            "install Rust (curl https://sh.rustup.rs | sh -s -- -y), "
+            "brew install llvm, then: "
+            "LLVM_SYS_150_PREFIX=/opt/homebrew/opt/llvm "
+            "cargo install --git https://github.com/pascalkuthe/OpenVAF --root ~/.local"
         ),
     )
 
@@ -147,21 +161,31 @@ def detect_capabilities() -> dict:
     _cap_line("AI agent", caps["ai_agent"],
               ok_detail=ai_detail, fail_detail=ai_detail)
 
-    # ── anthropic Python package (needed for AI judge) ────────────────────────
+    # ── anthropic Python package (optional — Test 3 judge prefers Ollama) ───────
     try:
         import anthropic as _anthropic  # noqa: F401
         caps["anthropic_pkg"] = True
-        _cap_line("anthropic Python package", True, ok_detail="available (Test 3 judge enabled)")
+        _cap_line("anthropic Python package", True, ok_detail="available (used only if ANTHROPIC_API_KEY set)")
     except ImportError:
         caps["anthropic_pkg"] = False
         _cap_line(
             "anthropic Python package",
             False,
-            fail_detail=(
-                "not installed — Test 3 AI judge requires Claude API directly. "
-                "Fix: pip install anthropic  (also set ANTHROPIC_API_KEY)"
-            ),
+            fail_detail="not installed — Test 3 will use Ollama as judge instead of Claude API. Fix: pip install anthropic",
         )
+
+    # ── Test 3 judge backend ──────────────────────────────────────────────────
+    has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    if has_api_key and caps["anthropic_pkg"]:
+        caps["judge_backend"] = "claude"
+        _cap_line("Test 3 judge backend", True, ok_detail="Claude API (ANTHROPIC_API_KEY set)")
+    elif caps["ai_agent"]:
+        caps["judge_backend"] = "ollama"
+        _cap_line("Test 3 judge backend", True, ok_detail="Ollama (local, no API cost)")
+    else:
+        caps["judge_backend"] = None
+        _cap_line("Test 3 judge backend", False,
+                  fail_detail="no AI backend available — Test 3 will be skipped")
 
     # ── non-AI pipeline ───────────────────────────────────────────────────────
     nonai_mod, nonai_err = _try_import(
@@ -268,36 +292,16 @@ def _load_netlist(path: Path) -> str:
     return path.read_text()
 
 
-def _strip_control_blocks(netlist_text: str) -> str:
-    """
-    Remove .control/.endc blocks from a netlist before embedding it in a
-    simulation deck. NgspiceRunner builds its own .control block; nesting
-    them causes 'Nesting of .control statements is not allowed' in ngspice.
-    """
-    out, in_block = [], False
-    for line in netlist_text.splitlines():
-        upper = line.strip().upper()
-        if upper.startswith(".CONTROL"):
-            in_block = True
-            continue
-        if upper.startswith(".ENDC"):
-            in_block = False
-            continue
-        if not in_block:
-            out.append(line)
-    return "\n".join(out)
-
-
 def _run_dc_ac(netlist_text: str):
     """
     Run parse_netlist + dc_sweep + ac_sweep (same steps as run_pipeline steps 1-3).
     Returns (x, y, info, metrics, ac_metrics) — any may be None on failure.
+    Note: NgspiceRunner._strip_end_directive now also removes .control/.endc/.save
+    blocks, so raw netlists with those directives work fine here.
     """
     from pipeline import parse_netlist, _extract_dc_metrics, _extract_ac_metrics, \
         _get_source_positive_node  # noqa: PLC0415
     from ngspice_runner import NgspiceRunner  # noqa: PLC0415
-
-    netlist_text = _strip_control_blocks(netlist_text)
 
     try:
         info = parse_netlist(netlist_text)
@@ -430,7 +434,8 @@ def test2_warmstart(netlist_text: str, output_dir: Path, caps: dict,
 
     try:
         from ai_agent import create_agent, generate, compute_nrmse, \
-            evaluate_va_code, _is_dynamic_model  # noqa: PLC0415
+            evaluate_va_code  # noqa: PLC0415
+        from pipeline import _is_dynamic_model  # noqa: PLC0415
 
         agent = create_agent()
         print("      [warm-start] calling AI with non-AI baseline...")
@@ -464,17 +469,14 @@ def test3_judge(netlist_text: str, output_dir: Path, caps: dict,
                 va_ai: str | None, va_nonai: str | None,
                 x, y, info, metrics, ac_metrics) -> dict:
     """
-    Send both VA codes to Claude as a judge. Claude returns the best merged model.
-    Requires anthropic package + ANTHROPIC_API_KEY (Ollama lacks instruction-following
-    reliability for structured judge tasks).
+    Send both VA codes to an AI judge, which returns the single best merged model.
+
+    Backend priority:
+      1. Claude API  (if ANTHROPIC_API_KEY set + anthropic package installed)
+      2. Ollama      (local, free, no API key needed) — default
     """
-    if not caps["anthropic_pkg"]:
-        return _skipped(
-            "anthropic Python package not installed "
-            "(pip install anthropic + set ANTHROPIC_API_KEY)"
-        )
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        return _skipped("ANTHROPIC_API_KEY not set — AI judge requires Claude API")
+    if not caps.get("judge_backend"):
+        return _skipped("no AI backend available for judge")
     if va_ai is None and va_nonai is None:
         return _skipped("both VA inputs are None — nothing to judge")
     if x is None or info is None:
@@ -518,19 +520,30 @@ def test3_judge(netlist_text: str, output_dir: Path, caps: dict,
     judge_prompt = "\n".join(lines)
 
     try:
-        import anthropic  # noqa: PLC0415
         from ai_agent import clean_code  # noqa: PLC0415
 
-        client = anthropic.Anthropic()
-        print("      [judge] calling Claude claude-sonnet-4-6...", end="", flush=True)
-        msg = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2048,
-            system=_JUDGE_SYSTEM,
-            messages=[{"role": "user", "content": judge_prompt}],
-        )
-        print(" done")
-        va_code = clean_code(msg.content[0].text)
+        backend = caps["judge_backend"]
+
+        if backend == "claude":
+            import anthropic  # noqa: PLC0415
+            client = anthropic.Anthropic()
+            print("      [judge] calling Claude claude-sonnet-4-6...", end="", flush=True)
+            msg = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=2048,
+                system=_JUDGE_SYSTEM,
+                messages=[{"role": "user", "content": judge_prompt}],
+            )
+            print(" done")
+            va_code = clean_code(msg.content[0].text)
+
+        else:  # ollama
+            from ai_agent import OllamaAgent  # noqa: PLC0415
+            agent = OllamaAgent()
+            print(f"      [judge] calling Ollama {agent.model}...", end="", flush=True)
+            va_code = clean_code(agent.chat(_JUDGE_SYSTEM, judge_prompt))
+            print(" done")
+
         score_str = _score(va_code, x, y, info["output_node"])
 
         out = output_dir / "judge"
@@ -548,10 +561,7 @@ _OSDI_TESTBENCH_TEMPLATE = """\
 * OSDI equivalence testbench for {module_name}
 * Compares: SPICE golden vs Verilog-AMS compiled model
 
-.title OSDI validation — {module_name}
-
-* Load the compiled Verilog-AMS model
-.osdi {osdi_path}
+.title OSDI validation {module_name}
 
 * ── Golden SPICE circuit ────────────────────────────────────────────
 {netlist_body}
@@ -561,7 +571,13 @@ X_model {signal_source} {output_node}_model {module_name}
 
 * ── DC sweep ────────────────────────────────────────────────────────
 .DC {signal_source} {dc_start} {dc_stop} {dc_step}
-.PRINT DC v({output_node}) v({output_node}_model)
+
+.control
+* Load OSDI model (must happen before run in batch mode)
+osdi {osdi_path}
+run
+print v({output_node}) v({output_node}_model)
+.endc
 
 .END
 """
@@ -577,19 +593,14 @@ def test4_osdi(netlist_text: str, output_dir: Path, caps: dict,
     """
     if not caps["openvaf"]:
         return _skipped(
-            "OpenVAF not installed. "
-            "No pre-built macOS ARM64 binary exists. "
-            "To build: install Rust (curl https://sh.rustup.rs | sh), "
-            "then: cargo install --git https://github.com/pascalkuthe/OpenVAF "
-            "(requires LLVM 14+: brew install llvm). "
-            "Also needs ngspice compiled with --enable-osdi."
+            "OpenVAF not installed. Build: install Rust (curl https://sh.rustup.rs | sh -s -- -y), "
+            "brew install llvm, then: LLVM_SYS_150_PREFIX=/opt/homebrew/opt/llvm "
+            "cargo install --git https://github.com/pascalkuthe/OpenVAF --root ~/.local"
         )
     if not caps["ngspice_osdi"]:
         return _skipped(
-            "ngspice not compiled with --enable-osdi. "
-            "The Homebrew bottle lacks this flag. "
-            "Fix: brew uninstall ngspice && compile from source with "
-            "./configure --enable-osdi --enable-xspice --enable-cider"
+            f"OSDI-enabled ngspice not at {caps.get('osdi_ngspice_bin', '~/.local/bin/ngspice-osdi')}. "
+            "Build from source: ./configure --enable-osdi, make, cp src/ngspice ~/.local/bin/ngspice-osdi"
         )
     if va_code is None:
         return _skipped("no VA code available to compile")
@@ -610,9 +621,11 @@ def test4_osdi(netlist_text: str, output_dir: Path, caps: dict,
 
     # Compile with OpenVAF
     osdi_path = out / "model.osdi"
+    openvaf_bin = caps.get("openvaf_bin", "openvaf")
+    ngspice_bin = caps.get("osdi_ngspice_bin", "ngspice")
     print(f"      [osdi] compiling {va_path.name} with OpenVAF...", end="", flush=True)
     result = subprocess.run(
-        ["openvaf", str(va_path), "-o", str(osdi_path)],
+        [openvaf_bin, str(va_path), "-o", str(osdi_path)],
         capture_output=True, text=True, cwd=str(out)
     )
     if result.returncode != 0:
@@ -650,7 +663,7 @@ def test4_osdi(netlist_text: str, output_dir: Path, caps: dict,
     # Run ngspice
     print(f"      [osdi] running ngspice testbench...", end="", flush=True)
     ng_result = subprocess.run(
-        ["ngspice", "-b", str(tb_path)],
+        [ngspice_bin, "-b", str(tb_path)],
         capture_output=True, text=True
     )
     if ng_result.returncode != 0:

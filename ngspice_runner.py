@@ -81,31 +81,83 @@ class NgspiceRunner:
     @staticmethod
     def _strip_end_directive(netlist: str) -> str:
         """
-        Remove .END lines from a netlist string before embedding it in a
-        simulation deck.
+        Remove directives from a netlist string that would conflict with the
+        simulation deck NgspiceRunner builds around the embedded netlist.
 
-        Per SPICE 3F5 §2, .END marks the absolute end of the circuit
-        description.  When the netlist text is embedded inside a larger deck
-        (which adds .DC / .AC / .control / .endc / .end of its own), any .END
-        in the embedded portion would terminate parsing of the *entire* deck
-        before the analysis commands are reached — causing a silent simulation
-        failure where ngspice exits with no data.
+        Strips:
+          .END      — SPICE 3F5 §2: terminates entire input file; would stop
+                      parsing before the injected .DC/.AC/.control block.
+          .CONTROL  — ngspice does not allow nested .control blocks; the deck
+                      adds its own. Any interactive-mode .control/.endc in the
+                      netlist must be removed.
+          .ENDC     — matching close of .CONTROL block.
+          .SAVE     — batch-mode .SAVE can conflict with the deck's .PRINT;
+                      safe to drop since the deck specifies its own print list.
 
         Preserves:
           .ENDS  — subcircuit end directive
           .ENDL  — library section end directive
         """
         out = []
+        in_control = False
         for line in netlist.splitlines():
             upper = line.strip().upper()
+            # Track .CONTROL/.ENDC block boundaries
+            if upper.startswith('.CONTROL'):
+                in_control = True
+                continue
+            if upper.startswith('.ENDC'):
+                in_control = False
+                continue
+            if in_control:
+                continue  # drop everything inside .control blocks
+            # Strip .END (but not .ENDS / .ENDL)
             is_end = (
                 upper.startswith('.END')
                 and not upper.startswith('.ENDS')
                 and not upper.startswith('.ENDL')
             )
-            if not is_end:
-                out.append(line)
+            if is_end:
+                continue
+            # Strip .SAVE (deck uses explicit .PRINT)
+            if upper.startswith('.SAVE'):
+                continue
+            out.append(line)
         return '\n'.join(out)
+
+    @staticmethod
+    def _strip_analysis_directives(netlist: str) -> str:
+        """
+        Remove standalone SPICE analysis directives from a netlist string
+        before embedding it in a deck.  NgspiceRunner always adds its own
+        analysis command (.dc / .ac / .tran / .op), so any pre-existing
+        directive in the user's netlist creates a duplicate analysis.
+
+        Strips: .DC  .AC  .TRAN  .OP  (case-insensitive)
+        Preserves: .MODEL, .PARAM, .SUBCKT, .ENDS, and all device lines.
+        """
+        out = []
+        skip_prefixes = ('.DC', '.AC', '.TRAN', '.OP')
+        for line in netlist.splitlines():
+            upper = line.strip().upper()
+            if any(upper.startswith(p) and (len(upper) == len(p) or not upper[len(p)].isalpha())
+                   for p in skip_prefixes):
+                continue
+            out.append(line)
+        return '\n'.join(out)
+
+    @staticmethod
+    def _as_voltage_ref(node: str) -> str:
+        """
+        Return the ngspice voltage reference string for a node name.
+        If the node is already wrapped in v() or i(), return as-is.
+        Otherwise wrap it: '3' → 'v(3)', 'out' → 'v(out)'.
+        """
+        s = node.strip()
+        lower = s.lower()
+        if lower.startswith('v(') or lower.startswith('i('):
+            return s
+        return f'v({s})'
 
     def _find_voltage_source_for_node(self, netlist, node_name):
         """
@@ -211,28 +263,37 @@ class NgspiceRunner:
         step = sweep_params['step']
         observe = sweep_params['observe']
 
+        # Strip directives from the embedded netlist that would conflict with
+        # the deck NgspiceRunner builds.  _strip_end_directive already removes
+        # .END / .CONTROL / .ENDC / .SAVE.  Also strip standalone analysis
+        # directives (.DC / .AC / .TRAN / .OP) since NgspiceRunner injects
+        # its own; keeping the original causes duplicate analyses.
+        clean_netlist = self._strip_end_directive(
+            self._strip_analysis_directives(netlist)
+        )
+
+        # .dc requires a SOURCE NAME (e.g. "VGS"), not a node name (e.g. "vg").
+        # Map node names to their driving source if the caller passed a net name.
+        sweep_src = self._find_voltage_source_for_node(clean_netlist, sweep_var)
+
         # Only print the observe variables — ngspice always outputs v-sweep as the
         # x-axis column regardless, so printing the sweep source name (e.g. "Vin")
         # causes a "vector not available" warning and breaks the output.
-        observe_list = [v for v in observe if v != sweep_var]
+        # Wrap bare node names in v() so ngspice prints simulation data, not
+        # the literal scalar value of the name (e.g. '3' → 'v(3)').
+        observe_list = [self._as_voltage_ref(v) for v in observe if v != sweep_var]
 
         # Build options line
         options_line = ""
         if 'options' in strategy:
             options_line = f".options {strategy['options']}\n"
 
-        # Strip any .END directives from the embedded netlist.  Per SPICE 3F5
-        # §2, .END terminates the *entire* input file; if the user's netlist
-        # contains .END and we embed it verbatim, ngspice stops parsing before
-        # it ever reaches the .dc / .control commands below.
-        clean_netlist = self._strip_end_directive(netlist)
-
         # Build complete deck
         deck = f"""* Auto-generated DC sweep deck
 {clean_netlist}
 
 {options_line}
-.dc {sweep_var} {start} {stop} {step}
+.dc {sweep_src} {start} {stop} {step}
 
 .control
 run
@@ -299,8 +360,10 @@ quit
         options_line = (f".options {strategy['options']}\n"
                         if 'options' in strategy else "")
 
-        # Strip .END before embedding (see _build_dc_sweep_deck for rationale).
-        clean_netlist = self._strip_end_directive(netlist)
+        # Strip .END / .CONTROL / analysis directives before embedding.
+        clean_netlist = self._strip_end_directive(
+            self._strip_analysis_directives(netlist)
+        )
 
         return f"""* Auto-generated 2D DC sweep deck
 {clean_netlist}
@@ -485,8 +548,10 @@ quit
             modified.append(ln)
         netlist_modified = '\n'.join(modified)
 
-        # Strip .END before embedding (see _build_dc_sweep_deck for rationale).
-        clean_netlist = self._strip_end_directive(netlist_modified)
+        # Strip .END / .CONTROL / analysis directives before embedding.
+        clean_netlist = self._strip_end_directive(
+            self._strip_analysis_directives(netlist_modified)
+        )
 
         options_line  = (f".options {strategy['options']}\n"
                          if 'options' in strategy else "")
@@ -567,8 +632,10 @@ quit
         observe = tran_params.get('observe', [])
         uic = tran_params.get('uic', False)
 
-        # Strip .END from netlist
-        netlist_clean = self._strip_end_directive(netlist)
+        # Strip .END / .CONTROL / analysis directives from netlist
+        netlist_clean = self._strip_end_directive(
+            self._strip_analysis_directives(netlist)
+        )
 
         # Build .TRAN directive
         # Format: .TRAN tstep tstop <tstart> <tmax> <UIC>
@@ -687,8 +754,10 @@ quit
                 modified.append(ln)
             netlist = '\n'.join(modified)
 
-        # Strip .END before embedding (see _build_dc_sweep_deck for rationale).
-        netlist = self._strip_end_directive(netlist)
+        # Strip .END / .CONTROL / analysis directives before embedding.
+        netlist = self._strip_end_directive(
+            self._strip_analysis_directives(netlist)
+        )
 
         observe_list = []
         for node in output_nodes:

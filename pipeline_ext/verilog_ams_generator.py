@@ -81,6 +81,10 @@ class VerilogAMSGenerator:
             code = self._generate_oscillator_module(
                 module_name, output_name, model, fitted_model['data']
             )
+        elif model['model_type'] == 'dynamic':
+            code = self._generate_dynamic_module(
+                module_name, input_name, output_name, model, fitted_model.get('data', {})
+            )
         else:
             raise ValueError(f"Unknown model type: {model['model_type']}")
 
@@ -406,6 +410,79 @@ class VerilogAMSGenerator:
         code += f"        V({output_clean}) <+ dc_gain * V({input_clean});\n"
         code += "    end\n"
         code += "endmodule\n"
+
+        return code
+
+    def _generate_dynamic_module(self, module_name, input_name, output_name, model, data):
+        """
+        Generate Verilog-AMS for dynamic model (from fit_dynamic_transfer_function).
+
+        If oscillator data is present → generates a free-running oscillator.
+        Otherwise → generates a first-order laplace_nd lowpass model.
+        """
+        import math
+        combined = model.get('combined_params', {})
+        oscillator = model.get('oscillator')
+
+        out_clean = (output_name or 'out').replace('net:', '')
+        in_clean = (input_name or 'in') if not isinstance(input_name, list) else input_name[0]
+        in_clean = str(in_clean).replace('net:', '') if in_clean is not None else 'in'
+
+        if oscillator and oscillator.get('is_oscillating'):
+            freq = combined.get('frequency') or oscillator.get('frequency', 1e9)
+            amp = combined.get('amplitude') or oscillator.get('amplitude', 0.9)
+            offset = oscillator.get('offset', 0.9)
+            v_norm = oscillator.get('amplitude', 1.0)
+            # Simple waveform classification
+            waveform_type = 'sine'  # default; transient-only, don't re-classify
+            osc_model = {
+                'model_type': 'oscillator',
+                'intent': 'dynamic',
+                'waveform': waveform_type,
+                'params': {
+                    'frequency': freq,
+                    'amplitude': amp,
+                    'offset': offset,
+                    'duty_cycle': oscillator.get('duty_cycle', 0.5),
+                }
+            }
+            return self._generate_oscillator_module(module_name, output_name, osc_model, data)
+
+        # Step-response / first-order lowpass model
+        dc_gain = combined.get('dc_gain') or 1.0
+        bandwidth = combined.get('bandwidth')
+
+        header = f"""`include "disciplines.vams"
+`include "constants.vams"
+
+// Dynamic behavioral model: {module_name}
+// DC gain: {dc_gain:.4g}
+// Bandwidth: {f'{bandwidth/1e6:.2f} MHz' if bandwidth else 'unknown'}
+"""
+        if bandwidth and bandwidth > 0:
+            tau = 1.0 / (2.0 * math.pi * bandwidth)
+            code = header
+            code += f"module {module_name}(\n"
+            code += f"    input electrical {in_clean},\n"
+            code += f"    output electrical {out_clean}\n"
+            code += ");\n\n"
+            code += f"    parameter real dc_gain = {dc_gain:.12e};\n"
+            code += f"    parameter real tau = {tau:.12e};  // 1/(2*pi*BW)\n\n"
+            code += "    analog begin\n"
+            code += f"        V({out_clean}) <+ laplace_nd(V({in_clean}) * dc_gain, {{1.0}}, {{1.0, tau}});\n"
+            code += "    end\n"
+            code += "endmodule\n"
+        else:
+            code = header
+            code += f"module {module_name}(\n"
+            code += f"    input electrical {in_clean},\n"
+            code += f"    output electrical {out_clean}\n"
+            code += ");\n\n"
+            code += f"    parameter real dc_gain = {dc_gain:.12e};\n\n"
+            code += "    analog begin\n"
+            code += f"        V({out_clean}) <+ V({in_clean}) * dc_gain;\n"
+            code += "    end\n"
+            code += "endmodule\n"
 
         return code
 
