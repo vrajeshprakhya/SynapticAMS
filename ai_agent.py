@@ -66,7 +66,7 @@ For a first-order lowpass H(s)=1/(1+s*tau): use num={1.0}, den={1.0, tau}.
 
 # ── Prompt builders ────────────────────────────────────────────────────
 
-def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None):
+def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None, baseline_va=None):
     import math as _math
 
     lines = [
@@ -200,6 +200,18 @@ def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None):
             f"output node='{info['output_node']}', VDD={info['vdd']} V",
             "",
             "Generate the Verilog-AMS module:",
+        ]
+
+    if baseline_va is not None:
+        lines += [
+            "",
+            "## Numerically-Fitted Baseline Model (from non-AI pipeline)",
+            "A numeric curve-fitting pipeline has already generated the following",
+            "Verilog-AMS model. Use it as a starting point: keep the structure if",
+            "it is correct, but fix any inaccuracies you can identify from the",
+            "sweep data and metrics above.",
+            "",
+            baseline_va.strip(),
         ]
 
     return "\n".join(lines)
@@ -498,13 +510,14 @@ def create_agent(provider=None, model=None):
 
 # ── Public API ─────────────────────────────────────────────────────────
 
-def generate(agent, netlist, x, y, info, metrics=None, ac_metrics=None):
+def generate(agent, netlist, x, y, info, metrics=None, ac_metrics=None, baseline_va=None):
     """Initial Verilog-AMS generation."""
     name = f"{type(agent).__name__}/{getattr(agent, 'model', '?')}"
     print(f"      [{name}] generating...", end="", flush=True)
     code = clean_code(agent.chat(
         SYSTEM_PROMPT,
-        _build_prompt(netlist, x, y, info, metrics=metrics, ac_metrics=ac_metrics),
+        _build_prompt(netlist, x, y, info, metrics=metrics, ac_metrics=ac_metrics,
+                      baseline_va=baseline_va),
     ))
     print(" done")
     return code
