@@ -246,8 +246,8 @@ def clean_code(text):
 # ── Ollama backend ─────────────────────────────────────────────────────
 
 class OllamaAgent:
-    DEFAULT_MODEL = "qwen2.5-coder:7b"
-    BASE_URL      = "http://192.168.1.168:11434"  # Remote Ollama server
+    DEFAULT_MODEL = "deepseek-r1:32b"
+    BASE_URL      = "http://192.168.1.34:11434"  # Remote Ollama server
 
     def __init__(self, model=None, base_url=None, timeout=180):
         self.model    = model    or self.DEFAULT_MODEL
