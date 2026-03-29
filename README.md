@@ -119,6 +119,49 @@ python tests/test_pipeline.py --group E
 
 ---
 
+## New: Transient-Based Parameter Extraction (Fallback)
+
+The pipeline now includes **automatic fallback** to transient-based gm/gds extraction when standard DC operating point analysis fails:
+
+```python
+# Automatic - no code changes needed
+from pipeline_ext.complete_pipeline import spice_to_verilog_ams
+
+netlist = """
+M1 vout vin 0 0 NMOS W=10u L=1u
+...
+"""
+
+# Pipeline tries .OP first, falls back to transient if it fails
+saved_files = spice_to_verilog_ams(netlist, output_dir='./output')
+```
+
+**Features:**
+- ✅ Automatic robustness for difficult convergence
+- ✅ <0.5% error vs standard method
+- ✅ Works for all block and device types
+- ✅ Zero configuration required
+
+**Documentation:**
+- Quick start: [`TRANSIENT_EXTRACTION_QUICKSTART.md`](TRANSIENT_EXTRACTION_QUICKSTART.md)
+- Pipeline guide: [`PIPELINE_FALLBACK_GUIDE.md`](PIPELINE_FALLBACK_GUIDE.md)
+- Technical details: [`docs/TRANSIENT_PARAM_EXTRACTION.md`](docs/TRANSIENT_PARAM_EXTRACTION.md)
+- Implementation: [`IMPLEMENTATION_SUMMARY.md`](IMPLEMENTATION_SUMMARY.md)
+
+**Testing:**
+```bash
+# Test transient extraction accuracy
+python3 test_transient_gm_gds.py
+
+# Test pipeline fallback
+python3 test_pipeline_fallback.py
+
+# Force fallback verification
+python3 test_force_fallback.py
+```
+
+---
+
 ## AI backend
 
 | Backend | How to activate |

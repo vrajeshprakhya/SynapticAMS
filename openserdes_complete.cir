@@ -1,0 +1,138 @@
+* Complete SerDes from OpenSERDES Blocks
+* Purpose: Validate SynapticAMS pipeline with proven OpenSERDES components
+* Date: 2026-03-17
+* Architecture: Data Input -> Inv Transmitter -> Channel -> Receiver
+
+.title OpenSERDES Complete SerDes
+
+* =============================================================================
+* PARAMETERS
+* =============================================================================
+.param vdd=3.3              $ Supply voltage
+.param tx_data_dc=1.65      $ TX input data level (mid-rail)
+
+* =============================================================================
+* SUBCIRCUIT DEFINITIONS (from OpenSERDES)
+* =============================================================================
+
+* Inverter subcircuit (basic building block)
+.subckt Inverter0 GND VDD INP OUT
+M0 OUT INP GND GND nshort L=0.15u W=2u
+M1 OUT INP VDD VDD pshort L=0.15u W=4u
+.ends Inverter0
+
+* Resistive feedback inverter (for receiver input)
+.subckt Resist_FB_INV GND VDD INP OUT
+M0 OUT INP GND GND nshort L=0.15u W=5u
+M1 OUT INP VDD VDD pshort L=0.15u W=10u
+Rfb OUT INP 10k
+.ends Resist_FB_INV
+
+* Output inverter (larger for driving loads)
+.subckt Inverter2 GND VDD INP OUT
+M0 OUT INP GND GND nshort L=0.15u W=15u m=3
+M1 OUT INP VDD VDD pshort L=0.15u W=30u m=3
+.ends Inverter2
+
+* Transmitter (2-stage inverter chain)
+.subckt Inv_Transmitter GND VDD VIN VOUT
+Xinv0 GND VDD VIN stage1 Inverter0
+Xinv2 GND VDD stage1 VOUT Inverter2
+.ends Inv_Transmitter
+
+* Receiver (resistive feedback inverter + output buffer)
+.subckt Receiver GND VDD RX_IN RX_OUT
+Xrx_input GND VDD RX_IN stage1 Resist_FB_INV
+Xrx_output GND VDD stage1 RX_OUT Inverter2
+.ends Receiver
+
+* =============================================================================
+* SUPPLY VOLTAGES
+* =============================================================================
+VDD dd 0 DC {vdd}
+
+* =============================================================================
+* TX PATH
+* =============================================================================
+
+* TX Input Data Source
+Vtx_data tx_data 0 DC {tx_data_dc}
+
+* TX Transmitter
+Xtx dd 0 tx_data tx_out Inv_Transmitter
+
+* TX Output termination
+Rtx_term tx_out 0 50
+
+* =============================================================================
+* CHANNEL
+* =============================================================================
+* Simple RC transmission line model
+
+* Channel resistance (1 ohm)
+Rchan tx_out rx_in 1
+
+* Channel capacitance (5pF)
+Cchan rx_in 0 5p
+
+* =============================================================================
+* RX PATH
+* =============================================================================
+
+* RX Receiver
+Xrx dd 0 rx_in rx_out Receiver
+
+* RX Output load
+Crx_load rx_out 0 1p
+
+* =============================================================================
+* TRANSISTOR MODELS (Simple Level 1 from OpenSERDES)
+* =============================================================================
+
+.model nshort NMOS (
++  Level=1
++  Vto=0.7
++  Kp=110u
++  Gamma=0.4
++  Phi=0.7
++  Lambda=0.04
++  Tox=9n
++  Cgso=0.2n
++  Cgdo=0.2n
++  Cj=0.5m
++  Cjsw=0.3n
++  Pb=0.8
++)
+
+.model pshort PMOS (
++  Level=1
++  Vto=-0.7
++  Kp=50u
++  Gamma=0.4
++  Phi=0.7
++  Lambda=0.05
++  Tox=9n
++  Cgso=0.2n
++  Cgdo=0.2n
++  Cj=0.5m
++  Cjsw=0.3n
++  Pb=0.8
++)
+
+* =============================================================================
+* ANALYSIS
+* =============================================================================
+
+* Operating Point Analysis
+.OP
+
+* DC Sweep: Sweep TX input to observe TX->RX transfer
+*.DC Vtx_data 0 {vdd} 0.1
+
+* Transient Analysis: Observe data transmission
+.TRAN 10p 10n
+
+* Print key nodes
+.PRINT TRAN v(tx_data) v(tx_out) v(rx_in) v(rx_out)
+
+.END

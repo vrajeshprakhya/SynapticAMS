@@ -904,6 +904,244 @@ def _classify_waveform_shape(time, voltage, analysis):
 
 
 # ============================================================
+# Dynamic Transfer Function (DC + Transient Combined)
+# ============================================================
+
+def analyze_step_response(time, voltage, input_step_size=1.0):
+    """
+    Analyze a transient step response to extract dynamic characteristics.
+
+    Args:
+        time: 1D array of time points (seconds)
+        voltage: 1D array of output voltage response
+        input_step_size: Magnitude of input step (V)
+
+    Returns:
+        dict: {
+            'dc_gain': float (from final value),
+            'rise_time': float (10% to 90% in seconds),
+            'settling_time': float (to within 2% of final value),
+            'bandwidth': float (estimated -3dB bandwidth in Hz),
+            'time_constant': float (tau in seconds),
+            'overshoot': float (percentage overshoot),
+            'is_valid': bool (True if step response is usable)
+        }
+    """
+    if len(time) < 10 or len(voltage) < 10:
+        return {
+            'is_valid': False,
+            'dc_gain': 0.0,
+            'rise_time': 0.0,
+            'settling_time': 0.0,
+            'bandwidth': 0.0,
+            'time_constant': 0.0,
+            'overshoot': 0.0
+        }
+
+    # Extract initial and final values
+    initial_value = voltage[0]
+    final_value = voltage[-1]
+
+    # Check if there's actually a step response
+    delta_v = abs(final_value - initial_value)
+    if delta_v < 1e-9:
+        # No response - might be open circuit or no input
+        return {
+            'is_valid': False,
+            'dc_gain': 0.0,
+            'rise_time': 0.0,
+            'settling_time': 0.0,
+            'bandwidth': 0.0,
+            'time_constant': 0.0,
+            'overshoot': 0.0
+        }
+
+    # Calculate DC gain (output change / input change)
+    dc_gain = delta_v / abs(input_step_size) if input_step_size != 0 else 0.0
+
+    # Normalize response to 0-1 range
+    v_norm = (voltage - initial_value) / delta_v
+
+    # Find 10% and 90% points for rise time
+    idx_10 = np.argmax(v_norm >= 0.1)
+    idx_90 = np.argmax(v_norm >= 0.9)
+
+    if idx_10 >= idx_90:
+        # Invalid rise time (might be falling edge or noisy)
+        rise_time = time[-1] - time[0]  # Use total time as fallback
+    else:
+        rise_time = time[idx_90] - time[idx_10]
+
+    # Estimate bandwidth from rise time (for first-order system: BW ≈ 0.35/t_rise)
+    bandwidth = 0.35 / rise_time if rise_time > 0 else 0.0
+
+    # Find settling time (to within 2% of final value)
+    tolerance = 0.02
+    settled = np.abs(v_norm - 1.0) < tolerance
+
+    if np.any(settled):
+        # Find first point where it settles and stays settled
+        settled_idx = np.argmax(settled)
+        settling_time = time[settled_idx]
+    else:
+        # Never settled within tolerance
+        settling_time = time[-1]
+
+    # Calculate time constant (tau) from exponential fit
+    # For first-order: V(t) = Vf * (1 - exp(-t/tau))
+    # At t=tau, V = 0.632 * Vf
+    try:
+        idx_tau = np.argmax(v_norm >= 0.632)
+        time_constant = time[idx_tau] - time[0] if idx_tau > 0 else rise_time / 2.2
+    except:
+        time_constant = rise_time / 2.2  # Approximate for first-order system
+
+    # Calculate overshoot
+    peak_value = np.max(v_norm)
+    overshoot = max(0.0, (peak_value - 1.0) * 100.0)  # Percentage
+
+    return {
+        'is_valid': True,
+        'dc_gain': dc_gain,
+        'rise_time': rise_time,
+        'settling_time': settling_time,
+        'bandwidth': bandwidth,
+        'time_constant': time_constant,
+        'overshoot': overshoot,
+        'initial_value': initial_value,
+        'final_value': final_value
+    }
+
+
+def fit_dynamic_transfer_function(dc_x, dc_y, transient_time=None, transient_voltage=None,
+                                   input_step_size=1.0):
+    """
+    Combine DC sweep and transient step response into a unified transfer function.
+
+    This function creates models for DRIVEN circuits (amplifiers, filters) that combines:
+    - DC gain from DC sweep
+    - Bandwidth/dynamics from transient step response
+
+    Args:
+        dc_x: DC sweep input voltage array (or None if no DC data)
+        dc_y: DC sweep output voltage array (or None if no DC data)
+        transient_time: Transient simulation time array (or None if no transient)
+        transient_voltage: Transient output voltage array (or None if no transient)
+        input_step_size: Size of input step applied in transient (V)
+
+    Returns:
+        dict: {
+            'model_type': 'dynamic',
+            'intent': 'amplifier'/'filter'/'buffer',
+            'dc_model': dict (from DC sweep fitting),
+            'transient_model': dict (from step response),
+            'combined_params': dict (unified model parameters)
+        }
+    """
+    # Start with base model
+    model = {
+        'model_type': 'dynamic',
+        'intent': 'amplifier',  # Default, will refine based on data
+        'dc_model': None,
+        'transient_model': None,
+        'combined_params': {}
+    }
+
+    # STEP 1: Extract DC characteristics
+    dc_gain_source = None  # Track where DC gain came from
+
+    if dc_x is not None and dc_y is not None and len(dc_x) > 0 and len(dc_y) > 0:
+        # Fit DC transfer function
+        dc_result = fit_transfer_function(dc_x, dc_y)
+        model['dc_model'] = dc_result
+
+        # Extract DC gain
+        if dc_result['model_type'] == 'analytic':
+            # For linear: gain is slope
+            if dc_result['intent'] == 'linear':
+                dc_gain = dc_result['model']['regions'][0]['params']['a']
+            else:
+                # For nonlinear, estimate gain from endpoints
+                dc_gain = (dc_y[-1] - dc_y[0]) / (dc_x[-1] - dc_x[0]) if len(dc_x) > 1 else 1.0
+        else:
+            # LUT - estimate from data
+            dc_gain = (dc_y[-1] - dc_y[0]) / (dc_x[-1] - dc_x[0]) if len(dc_x) > 1 else 1.0
+
+        model['combined_params']['dc_gain'] = dc_gain
+        dc_gain_source = 'dc_sweep'
+    else:
+        model['combined_params']['dc_gain'] = None
+        dc_gain_source = None
+
+    # STEP 2: Extract transient/dynamic characteristics
+    if transient_time is not None and transient_voltage is not None and \
+       len(transient_time) > 0 and len(transient_voltage) > 0:
+
+        # Analyze step response
+        step_analysis = analyze_step_response(transient_time, transient_voltage, input_step_size)
+        model['transient_model'] = step_analysis
+
+        if step_analysis['is_valid']:
+            # Extract dynamic parameters
+            model['combined_params']['bandwidth'] = step_analysis['bandwidth']
+            model['combined_params']['time_constant'] = step_analysis['time_constant']
+            model['combined_params']['rise_time'] = step_analysis['rise_time']
+            model['combined_params']['overshoot'] = step_analysis['overshoot']
+
+            # If DC gain wasn't available from DC sweep, use transient
+            # This is the KEY FEATURE for handling ring oscillators and circuits that can't converge to DC
+            if model['combined_params']['dc_gain'] is None:
+                model['combined_params']['dc_gain'] = step_analysis['dc_gain']
+                dc_gain_source = 'transient'  # Extracted from transient step response
+
+            # Classify circuit type based on characteristics
+            if step_analysis['overshoot'] > 10:
+                model['intent'] = 'filter'  # Significant overshoot → filtering behavior
+            elif abs(step_analysis['dc_gain'] - 1.0) < 0.1:
+                model['intent'] = 'buffer'  # Unity gain → buffer
+            else:
+                model['intent'] = 'amplifier'  # Gain ≠ 1 → amplifier
+        else:
+            # Invalid transient - use DC-only model
+            model['combined_params']['bandwidth'] = None
+            model['combined_params']['time_constant'] = None
+    else:
+        # No transient data
+        model['combined_params']['bandwidth'] = None
+        model['combined_params']['time_constant'] = None
+
+    # STEP 3: Create unified model representation
+    # This represents a first-order system: H(s) = K / (1 + s*tau)
+    # where K = dc_gain, tau = time_constant
+
+    # Add metadata about DC gain source (important for ring oscillators!)
+    model['combined_params']['dc_gain_source'] = dc_gain_source
+
+    if model['combined_params'].get('dc_gain') is not None and \
+       model['combined_params'].get('time_constant') is not None:
+        # Full dynamic model available
+        model['combined_params']['model_class'] = 'first_order_lag'
+        source_note = f" (DC from {dc_gain_source})" if dc_gain_source else ""
+        model['combined_params']['transfer_function'] = (
+            f"H(s) = {model['combined_params']['dc_gain']:.3e} / "
+            f"(1 + s*{model['combined_params']['time_constant']:.3e}){source_note}"
+        )
+    elif model['combined_params'].get('dc_gain') is not None:
+        # DC-only model
+        model['combined_params']['model_class'] = 'dc_only'
+        source_note = f" (from {dc_gain_source})" if dc_gain_source else ""
+        model['combined_params']['transfer_function'] = (
+            f"H(s) = {model['combined_params']['dc_gain']:.3e}{source_note}"
+        )
+    else:
+        # No valid model
+        model['combined_params']['model_class'] = 'invalid'
+        model['combined_params']['transfer_function'] = None
+
+    return model
+
+
+# ============================================================
 # Example
 # ============================================================
 

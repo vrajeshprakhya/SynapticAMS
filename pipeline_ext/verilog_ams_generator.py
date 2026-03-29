@@ -39,12 +39,16 @@ class VerilogAMSGenerator:
         output_name = fitted_model['output']
         model = fitted_model['model']
 
-        # Check if this is a 2D model (input is a list)
+        # Check if this is a 2D model (input is a list) or autonomous (input is None)
         is_2d = isinstance(input_name, list)
+        is_autonomous = (input_name is None)
 
         if module_name is None:
             # Auto-generate name: output_vs_input
-            if is_2d:
+            if is_autonomous:
+                # Autonomous oscillator - no input
+                module_name = f"{output_name}_oscillator"
+            elif is_2d:
                 input_str = '_'.join(input_name)
                 module_name = f"{output_name}_vs_{input_str}"
             else:
@@ -80,6 +84,10 @@ class VerilogAMSGenerator:
         elif model['model_type'] == 'oscillator':
             code = self._generate_oscillator_module(
                 module_name, output_name, model, fitted_model['data']
+            )
+        elif model['model_type'] == 'dynamic':
+            code = self._generate_dynamic_module(
+                module_name, input_name, output_name, model, fitted_model['data']
             )
         else:
             raise ValueError(f"Unknown model type: {model['model_type']}")
@@ -645,6 +653,85 @@ class VerilogAMSGenerator:
 
         return code
 
+    def _generate_dynamic_module(self, module_name, input_name, output_name, model, data):
+        """
+        Generate Verilog-AMS for dynamic model (combines DC + transient)
+
+        Dynamic models have:
+        - DC gain from DC sweep
+        - Bandwidth/time constant from transient
+
+        If input_name is None, generates an autonomous oscillator (no inputs).
+        If input_name is a list, generates a multi-input module.
+        """
+        header = self._generate_header(module_name, model)
+
+        # Extract parameters
+        params = model.get('combined_params', {})
+        dc_gain = params.get('dc_gain', 1.0)
+        bandwidth = params.get('bandwidth')
+        time_constant = params.get('time_constant')
+        model_class = params.get('model_class', 'dc_only')
+
+        # Clean output name
+        output_clean = output_name.replace('net:', '').replace('v(', '').replace(')', '')
+
+        # Handle different input cases
+        if input_name is None:
+            # Autonomous oscillator (no inputs)
+            # Generate as oscillator model instead
+            # Update model type for correct header generation
+            oscillator_model = model.copy()
+            oscillator_model['model_type'] = 'oscillator'
+            return self._generate_oscillator_module(module_name, output_name, oscillator_model, data)
+
+        elif isinstance(input_name, list):
+            # Multi-input model
+            input_clean_list = [inp.replace('net:', '').replace('v(', '').replace(')', '') for inp in input_name]
+            inputs_decl = ',\n  '.join([f"input electrical {inp}" for inp in input_clean_list])
+
+            # For multi-input, use first input for now (simplified model)
+            # TODO: Implement proper multi-input transfer function
+            input_clean = input_clean_list[0]
+        else:
+            # Single input
+            input_clean = input_name.replace('net:', '').replace('v(', '').replace(')', '')
+            inputs_decl = f"input electrical {input_clean}"
+
+        # Generate module
+        code = header + f"""module {module_name} (
+  {inputs_decl},
+  output electrical {output_clean}
+);
+
+  // Dynamic model parameters
+  parameter real dc_gain = {dc_gain};"""
+
+        if bandwidth is not None and time_constant is not None:
+            code += f"""
+  parameter real bandwidth = {bandwidth};  // Hz
+  parameter real time_constant = {time_constant};  // seconds
+
+  // Model class: {model_class}
+  // Transfer function: H(s) = {dc_gain:.3e} / (1 + s*{time_constant:.3e})
+"""
+        else:
+            code += f"""
+
+  // Model class: {model_class} (DC-only, no dynamics available)
+"""
+
+        code += f"""
+  analog begin
+    // Simple DC gain model
+    V({output_clean}) <+ dc_gain * V({input_clean});
+  end
+
+endmodule
+"""
+
+        return code
+
     def _generate_header(self, module_name, model):
         """
         Generate file header with metadata
@@ -663,8 +750,23 @@ class VerilogAMSGenerator:
         elif model['model_type'] == 'oscillator':
             header += f"// Oscillator frequency: {model.get('params', {}).get('frequency', 'N/A')} Hz\n"
             header += f"// Waveform type: {model.get('waveform', 'unknown')}\n"
+        elif model['model_type'] == 'dynamic':
+            params = model.get('combined_params', {})
+            if params.get('dc_gain') is not None:
+                header += f"// DC gain: {params['dc_gain']:.3e}\n"
+            if params.get('bandwidth') is not None:
+                header += f"// Bandwidth: {params['bandwidth']:.3e} Hz\n"
+            if params.get('time_constant') is not None:
+                header += f"// Time constant: {params['time_constant']:.3e} s\n"
 
-        header += "\n`include \"disciplines.vams\"\n\n"
+        header += "\n`include \"disciplines.vams\"\n"
+
+        # Add constants.vams if the model uses M_PI or M_TWO_PI
+        # (oscillator models use these constants)
+        if model.get('model_type') == 'oscillator':
+            header += "`include \"constants.vams\"\n"
+
+        header += "\n"
 
         return header
 

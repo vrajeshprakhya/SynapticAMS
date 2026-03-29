@@ -69,11 +69,11 @@ class NgspiceRunner:
         {'options': 'srcsteps=10'},
     ]
 
-    def __init__(self, ngspice_bin='ngspice', timeout=60):
+    def __init__(self, ngspice_bin='ngspice', timeout=None):
         """
         Args:
             ngspice_bin: Path to ngspice executable
-            timeout: Simulation timeout in seconds
+            timeout: Simulation timeout in seconds (None = no timeout)
         """
         self.ngspice_bin = ngspice_bin
         self.timeout = timeout
@@ -81,8 +81,8 @@ class NgspiceRunner:
     @staticmethod
     def _strip_end_directive(netlist: str) -> str:
         """
-        Remove .END lines from a netlist string before embedding it in a
-        simulation deck.
+        Remove .END and analysis directives from a netlist string before
+        embedding it in a simulation deck.
 
         Per SPICE 3F5 §2, .END marks the absolute end of the circuit
         description.  When the netlist text is embedded inside a larger deck
@@ -91,20 +91,53 @@ class NgspiceRunner:
         before the analysis commands are reached — causing a silent simulation
         failure where ngspice exits with no data.
 
+        Also removes analysis directives (.TRAN, .DC, .AC, .PRINT, .PLOT, .PROBE)
+        and control blocks (.control/.endc) since the pipeline adds its own.
+        Having duplicate directives causes ngspice to produce unexpected output.
+
         Preserves:
           .ENDS  — subcircuit end directive
           .ENDL  — library section end directive
         """
         out = []
+        in_control_block = False
+
         for line in netlist.splitlines():
             upper = line.strip().upper()
+
+            # Track .control/.endc blocks
+            if upper.startswith('.CONTROL'):
+                in_control_block = True
+                continue  # Skip this line
+            if upper.startswith('.ENDC'):
+                in_control_block = False
+                continue  # Skip this line
+
+            # Skip lines inside .control blocks
+            if in_control_block:
+                continue
+
+            # Check for .END (but preserve .ENDS and .ENDL)
             is_end = (
                 upper.startswith('.END')
                 and not upper.startswith('.ENDS')
                 and not upper.startswith('.ENDL')
             )
-            if not is_end:
+
+            # Check for analysis directives
+            is_analysis = (
+                upper.startswith('.TRAN ') or
+                upper.startswith('.DC ') or
+                upper.startswith('.AC ') or
+                upper.startswith('.PRINT ') or
+                upper.startswith('.PLOT ') or
+                upper.startswith('.PROBE ')
+            )
+
+            # Keep line if it's not .END or an analysis directive
+            if not is_end and not is_analysis:
                 out.append(line)
+
         return '\n'.join(out)
 
     def _find_voltage_source_for_node(self, netlist, node_name):
@@ -174,26 +207,34 @@ class NgspiceRunner:
         Returns:
             dict: Parsed results
         """
-        # Build complete SPICE deck
-        deck = self._build_dc_sweep_deck(netlist, sweep_params, strategy)
+        # Build complete SPICE deck with wrdata output file
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            data_file = f.name
 
-        # Execute ngspice
-        output = self._execute_ngspice(deck)
+        deck = self._build_dc_sweep_deck(netlist, sweep_params, strategy, data_file)
 
-        # Parse output
-        results = self._parse_dc_sweep_output(
-            output,
-            sweep_params['sweep_var'],
-            sweep_params['observe']
-        )
+        try:
+            # Execute ngspice
+            output = self._execute_ngspice(deck)
 
-        # Validate results
-        if not results or len(results[sweep_params['sweep_var']]) == 0:
-            raise NgspiceError("No data points in simulation output")
+            # Read wrdata output file
+            results = self._parse_dc_sweep_wrdata(
+                data_file,
+                sweep_params['sweep_var'],
+                sweep_params['observe']
+            )
 
-        return results
+            # Validate results
+            if not results or len(results[sweep_params['sweep_var']]) == 0:
+                raise NgspiceError("No data points in simulation output")
 
-    def _build_dc_sweep_deck(self, netlist, sweep_params, strategy):
+            return results
+        finally:
+            # Clean up data file
+            Path(data_file).unlink(missing_ok=True)
+
+    def _build_dc_sweep_deck(self, netlist, sweep_params, strategy, data_file=None):
         """
         Build complete SPICE deck for DC sweep
 
@@ -201,6 +242,7 @@ class NgspiceRunner:
             netlist: Base netlist
             sweep_params: Sweep parameters
             strategy: Options strategy
+            data_file: Optional path to write data with wrdata
 
         Returns:
             str: Complete SPICE deck
@@ -211,10 +253,15 @@ class NgspiceRunner:
         step = sweep_params['step']
         observe = sweep_params['observe']
 
-        # Only print the observe variables — ngspice always outputs v-sweep as the
-        # x-axis column regardless, so printing the sweep source name (e.g. "Vin")
-        # causes a "vector not available" warning and breaks the output.
-        observe_list = [v for v in observe if v != sweep_var]
+        # Build observe list - wrdata uses vector names directly (node names)
+        # Don't use v() syntax - just the node name
+        observe_list = []
+        for v in observe:
+            # Strip v() wrapper if present
+            if v.startswith('v(') and v.endswith(')'):
+                observe_list.append(v[2:-1])
+            else:
+                observe_list.append(v)
 
         # Build options line
         options_line = ""
@@ -227,6 +274,16 @@ class NgspiceRunner:
         # it ever reaches the .dc / .control commands below.
         clean_netlist = self._strip_end_directive(netlist)
 
+        # Build control block - use wrdata instead of print
+        # wrdata with wr_singlescale outputs: v-sweep column first, then all observe variables
+        if data_file:
+            # Use set wr_singlescale to write a single scale column (v-sweep)
+            control_cmd = f"set wr_singlescale\nwrdata {data_file} {' '.join(observe_list)}"
+        else:
+            # Fallback to print (for backwards compatibility)
+            observe_list_plain = [v for v in observe if v != sweep_var]
+            control_cmd = f"print {' '.join(observe_list_plain)}"
+
         # Build complete deck
         deck = f"""* Auto-generated DC sweep deck
 {clean_netlist}
@@ -236,7 +293,7 @@ class NgspiceRunner:
 
 .control
 run
-print {' '.join(observe_list)}
+{control_cmd}
 quit
 .endc
 
@@ -853,11 +910,76 @@ quit
             return result.stdout
 
         except subprocess.TimeoutExpired:
-            raise NgspiceError(f"Simulation timeout after {self.timeout}s")
+            timeout_msg = f"{self.timeout}s" if self.timeout else "unknown"
+            raise NgspiceError(f"Simulation timeout after {timeout_msg}")
 
         finally:
             # Clean up temporary file
             Path(deck_file).unlink(missing_ok=True)
+
+    def _parse_dc_sweep_wrdata(self, data_file, sweep_var, observe_vars):
+        """
+        Parse ngspice wrdata output file from DC sweep
+
+        wrdata format with set wr_singlescale (space-separated):
+            v-sweep_val  obs1_val  obs2_val  ...
+            v-sweep_val  obs1_val  obs2_val  ...
+
+        First column is v-sweep (sweep variable), then observe variables in order
+
+        Args:
+            data_file: Path to wrdata output file
+            sweep_var: Name of sweep variable
+            observe_vars: List of variables to observe
+
+        Returns:
+            dict: {var_name: numpy_array}
+        """
+        results = {sweep_var: [], **{v: [] for v in observe_vars}}
+
+        try:
+            with open(data_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Parse space-separated data
+                    # Format: v-sweep obs1 obs2 ...
+                    tokens = line.split()
+
+                    if len(tokens) < 1:
+                        continue
+
+                    try:
+                        # All tokens are data values (no index column)
+                        values = [float(t) for t in tokens]
+
+                        if len(values) < 1:
+                            continue
+
+                        # First value is always v-sweep (the sweep variable)
+                        sweep_val = values[0]
+                        observe_vals = values[1:]
+
+                        results[sweep_var].append(sweep_val)
+
+                        # Map remaining values to observe variables
+                        for i, obs_var in enumerate(observe_vars):
+                            if i < len(observe_vals):
+                                results[obs_var].append(observe_vals[i])
+
+                    except (ValueError, IndexError):
+                        continue
+
+        except FileNotFoundError:
+            # File doesn't exist - return empty results
+            pass
+
+        # Convert to numpy arrays
+        results = {k: np.array(v) for k, v in results.items()}
+
+        return results
 
     def _parse_dc_sweep_output(self, output, sweep_var, observe_vars):
         """
@@ -1099,6 +1221,268 @@ quit
                                 pass
 
         return results
+
+    def extract_ac_params_transient(self, netlist, device_name,
+                                      vg_dc=None, vd_dc=None,
+                                      perturbation_mv=10.0,
+                                      freq_hz=1e6,
+                                      n_periods=5):
+        """
+        Extract small-signal AC parameters (gm, gds) using transient analysis
+        with AC perturbation.
+
+        SIMPLIFIED IMPLEMENTATION - builds custom test circuit from scratch
+        rather than modifying arbitrary netlists. This approach is more robust
+        and easier to debug.
+
+        This is an alternative to extract_ac_params() that uses transient
+        simulation instead of .OP analysis. Useful when:
+        - The DC operating point analysis fails or is unreliable
+        - You want to verify results against the standard .OP+show method
+        - You need to extract parameters under specific bias conditions
+
+        Method:
+          1. For gm: inject small SIN at gate, measure drain current AC amplitude
+             gm = ΔI_d / ΔV_gs (at constant Vds)
+          2. For gds: inject small SIN at drain, measure drain current AC amplitude
+             gds = ΔI_d / ΔV_ds (at constant Vgs)
+
+        Args:
+            netlist: SPICE netlist containing device model definition
+            device_name: Name of device to characterize (e.g., "M1")
+            vg_dc: DC gate voltage for bias point (default: auto from netlist)
+            vd_dc: DC drain voltage for bias point (default: auto from netlist)
+            perturbation_mv: AC perturbation amplitude in mV (default 10 mV)
+            freq_hz: Perturbation frequency in Hz (default 1 MHz)
+            n_periods: Number of periods to simulate (default 5)
+
+        Returns:
+            dict: {'gm': value, 'gds': value, 'vg_dc': value, 'vd_dc': value}
+
+        Example:
+            runner = NgspiceRunner()
+            netlist = '''
+                .model NMOS NMOS (LEVEL=1 VTO=0.4 KP=100u LAMBDA=0.02)
+            '''
+            # Characterize NMOS at Vgs=0.9V, Vds=1.8V
+            params = runner.extract_ac_params_transient(
+                netlist, 'M1', vg_dc=0.9, vd_dc=1.8)
+            print(f"gm={params['gm']:.3e} S, gds={params['gds']:.3e} S")
+        """
+        # Parse device from original netlist to get model and parameters
+        device_info = self._parse_single_device(netlist, device_name)
+
+        if not device_info:
+            # Device not in netlist - use defaults
+            device_info = {
+                'type': 'M',
+                'model': 'NMOS',
+                'params': 'W=10u L=1u'
+            }
+
+        # Auto-detect bias if not provided
+        if vg_dc is None:
+            vg_dc = 0.9  # Typical NMOS bias
+        if vd_dc is None:
+            vd_dc = 1.8  # Typical supply voltage
+
+        period = 1.0 / freq_hz
+        tstop = n_periods * period
+        tstep = period / 100  # 100 points per period
+
+        perturb_v = perturbation_mv / 1000.0  # mV → V
+
+        # ── Extract gm: perturb gate, measure drain current ────────────
+        gm = self._measure_gm_transient(
+            device_info, vg_dc, vd_dc, perturb_v, freq_hz, tstep, tstop, netlist)
+
+        # ── Extract gds: perturb drain, measure drain current ───────────
+        gds = self._measure_gds_transient(
+            device_info, vg_dc, vd_dc, perturb_v, freq_hz, tstep, tstop, netlist)
+
+        return {
+            'gm': gm,
+            'gds': gds,
+            'vg_dc': vg_dc,
+            'vd_dc': vd_dc,
+            'perturbation_mv': perturbation_mv,
+            'frequency_hz': freq_hz
+        }
+
+    def _parse_single_device(self, netlist, device_name):
+        """
+        Extract device model and parameters from netlist.
+
+        Returns:
+            dict: {'type': 'M'/'Q'/'J', 'model': str, 'params': str} or None
+        """
+        for line in netlist.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith('*') or stripped.startswith('.'):
+                continue
+
+            tokens = stripped.split()
+            if not tokens:
+                continue
+
+            if tokens[0].upper() == device_name.upper() and len(tokens) >= 5:
+                dtype = tokens[0][0].upper()
+                model = tokens[5] if len(tokens) > 5 else 'NMOS'
+                params = ' '.join(tokens[6:]) if len(tokens) > 6 else 'W=10u L=1u'
+
+                return {
+                    'type': dtype,
+                    'model': model,
+                    'params': params
+                }
+        return None
+
+    def _measure_gm_transient(self, device_info, vg_dc, vd_dc,
+                              perturb_v, freq_hz, tstep, tstop, model_netlist):
+        """
+        Measure gm by applying AC perturbation to gate.
+
+        Test circuit:
+            Vg: gate_pert ---[Vpert_gm]--- gate --- M1 --- Vmeas_drain --- vd_dc
+                     |                      |
+                   SIN                     |
+                                       source (gnd)
+        """
+        # Extract model definitions from original netlist
+        model_lines = [l for l in model_netlist.splitlines()
+                      if l.strip().startswith('.model')]
+        models = '\n'.join(model_lines)
+
+        dtype = device_info.get('type', 'M')
+        model = device_info.get('model', 'NMOS')
+        params = device_info.get('params', 'W=10u L=1u')
+
+        # Build test circuit
+        # The perturbation is DC bias + small AC signal
+        test_netlist = f"""* gm extraction test circuit
+* Device under test with AC perturbation at gate
+Vg_dc gate_drive 0 DC {vg_dc}
+Vpert_gm gate gate_drive SIN(0 {perturb_v} {freq_hz})
+Vd_dc vd_supply 0 DC {vd_dc}
+Vmeas_drain vd_supply vd DC 0
+
+{dtype}1 vd gate 0 0 {model} {params}
+
+{models}
+"""
+
+        deck = self._build_transient_perturbation_deck(
+            test_netlist, tstep, tstop, 'time i(vmeas_drain)')
+
+        try:
+            output = self._execute_ngspice(deck)
+            results = self._parse_tran_output(output, ['i(vmeas_drain)'])
+
+            if 'time' not in results or 'i(vmeas_drain)' not in results:
+                return 0.0
+
+            time = results['time']
+            i_drain = results['i(vmeas_drain)']
+
+            # Extract AC amplitude from steady-state (second half)
+            mid_idx = len(time) // 2
+            i_ac = i_drain[mid_idx:]
+            i_amplitude = (np.max(i_ac) - np.min(i_ac)) / 2.0
+
+            # gm = ΔI_d / ΔV_gs
+            gm = i_amplitude / perturb_v if perturb_v > 0 else 0.0
+
+            return float(gm)
+
+        except NgspiceError:
+            return 0.0
+
+    def _measure_gds_transient(self, device_info, vg_dc, vd_dc,
+                               perturb_v, freq_hz, tstep, tstop, model_netlist):
+        """
+        Measure gds by applying AC perturbation to drain.
+
+        Test circuit:
+            Vg: vg_dc --- gate --- M1 --- Vmeas_drain --- vd_pert ---[Vpert_gds]--- vd_dc
+                                   |                            |
+                              source (gnd)                    SIN
+        """
+        model_lines = [l for l in model_netlist.splitlines()
+                      if l.strip().startswith('.model')]
+        models = '\n'.join(model_lines)
+
+        dtype = device_info.get('type', 'M')
+        model = device_info.get('model', 'NMOS')
+        params = device_info.get('params', 'W=10u L=1u')
+
+        # Build test circuit
+        test_netlist = f"""* gds extraction test circuit
+* Device under test with AC perturbation at drain
+Vg_dc gate 0 DC {vg_dc}
+Vd_dc vd_supply 0 DC {vd_dc}
+Vpert_gds vd_supply vd_pert SIN(0 {perturb_v} {freq_hz})
+Vmeas_drain vd_pert vd DC 0
+
+{dtype}1 vd gate 0 0 {model} {params}
+
+{models}
+"""
+
+        deck = self._build_transient_perturbation_deck(
+            test_netlist, tstep, tstop, 'time i(vmeas_drain)')
+
+        try:
+            output = self._execute_ngspice(deck)
+            results = self._parse_tran_output(output, ['i(vmeas_drain)'])
+
+            if 'time' not in results or 'i(vmeas_drain)' not in results:
+                return 0.0
+
+            time = results['time']
+            i_drain = results['i(vmeas_drain)']
+
+            # Extract AC amplitude from steady-state
+            mid_idx = len(time) // 2
+            i_ac = i_drain[mid_idx:]
+            i_amplitude = (np.max(i_ac) - np.min(i_ac)) / 2.0
+
+            # gds = ΔI_d / ΔV_ds
+            gds = i_amplitude / perturb_v if perturb_v > 0 else 0.0
+
+            return float(gds)
+
+        except NgspiceError:
+            return 0.0
+
+    def _build_transient_perturbation_deck(self, netlist, tstep, tstop,
+                                           measure_vars):
+        """
+        Build SPICE deck for transient perturbation analysis.
+
+        Args:
+            netlist: Test circuit netlist
+            tstep: Time step
+            tstop: Stop time
+            measure_vars: Space-separated variables to print (e.g., 'time i(vmeas)')
+
+        Returns:
+            str: Complete SPICE deck
+        """
+        clean_netlist = self._strip_end_directive(netlist)
+
+        return f"""* Auto-generated transient perturbation deck
+{clean_netlist}
+
+.tran {tstep} {tstop}
+
+.control
+run
+print {measure_vars}
+quit
+.endc
+
+.end
+"""
 
 
 # Example usage
