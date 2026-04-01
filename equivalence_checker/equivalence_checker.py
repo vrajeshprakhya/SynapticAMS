@@ -937,7 +937,7 @@ quit
         try:
             result = subprocess.run(
                 [self.ngspice_bin, '-b', cir_file],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=60
             )
             return result.stdout
         finally:
@@ -1057,8 +1057,7 @@ quit
         """
         Parse DC sweep output from ngspice
 
-        This is a simplified parser that uses ngspice_runner's parsing logic.
-        For production, should use proper ngspice output parsing.
+        Uses NgspiceRunner's proper parsing logic for 1D and 2D sweeps.
 
         Args:
             output: ngspice stdout
@@ -1069,13 +1068,77 @@ quit
         Returns:
             dict: {output_name: array_of_values}
         """
-        # For now, use ngspice_runner's parsing which handles DC sweep properly
-        # This is a placeholder - the actual DC sweep will be handled by
-        # ngspice_runner.dc_sweep() or dc_sweep_2d() which have proper parsers
+        from ngspice_runner import NgspiceRunner
 
-        # Return NaN arrays as fallback (actual implementation delegated to ngspice_runner)
+        runner = NgspiceRunner()
+        inputs_clean = [inp.replace('net:', '') for inp in inputs]
         outputs_clean = [out.replace('net:', '') for out in outputs]
-        return {out: np.full(len(test_vectors), np.nan) for out in outputs}
+
+        try:
+            if len(inputs) == 1:
+                # 1D sweep - use 1D parser
+                results = runner._parse_dc_sweep_output(
+                    output,
+                    inputs_clean[0],
+                    outputs_clean
+                )
+                # Return with original output names
+                return {out: results.get(out.replace('net:', ''), np.full(len(test_vectors), np.nan))
+                        for out in outputs}
+
+            elif len(inputs) == 2:
+                # 2D sweep - use 2D parser with sweep parameters
+                inp1_vals = np.unique(test_vectors[:, 0])
+                inp2_vals = np.unique(test_vectors[:, 1])
+
+                start1 = inp1_vals[0]
+                stop1 = inp1_vals[-1]
+                step1 = (stop1 - start1) / (len(inp1_vals) - 1) if len(inp1_vals) > 1 else 0.1
+
+                start2 = inp2_vals[0]
+                stop2 = inp2_vals[-1]
+                step2 = (stop2 - start2) / (len(inp2_vals) - 1) if len(inp2_vals) > 1 else 0.1
+
+                sweep_params = {
+                    'sweep_var_1': inputs_clean[0],
+                    'sweep_var_2': inputs_clean[1],
+                    'start_1': start1,
+                    'stop_1': stop1,
+                    'step_1': step1,
+                    'start_2': start2,
+                    'stop_2': stop2,
+                    'step_2': step2,
+                    'observe': outputs_clean
+                }
+
+                results = runner._parse_dc_sweep_2d_output(
+                    output,
+                    inputs_clean[0],
+                    inputs_clean[1],
+                    outputs_clean,
+                    sweep_params
+                )
+
+                # Flatten 2D results to match test_vectors order
+                flattened = {}
+                for out in outputs:
+                    out_clean = out.replace('net:', '')
+                    if out_clean in results:
+                        data = results[out_clean]
+                        # If 2D array, flatten to 1D (row-major order)
+                        flattened[out] = data.ravel() if data.ndim == 2 else data
+                    else:
+                        flattened[out] = np.full(len(test_vectors), np.nan)
+
+                return flattened
+
+            else:
+                # 3D+ not supported
+                return {out: np.full(len(test_vectors), np.nan) for out in outputs}
+
+        except Exception as e:
+            print(f"Warning: DC sweep parsing failed: {e}")
+            return {out: np.full(len(test_vectors), np.nan) for out in outputs}
 
     def _inject_test_vector(self, netlist: str, inputs: List[str], vector: np.ndarray) -> str:
         """

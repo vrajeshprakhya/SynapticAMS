@@ -1,0 +1,158 @@
+[
+  {
+    "module": "tx_out_n_vs_tx_in_p",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {},
+    "error_msg": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'",
+    "pass1_error": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'"
+  },
+  {
+    "module": "rx_out_p_vs_tx_in_p",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {},
+    "error_msg": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'",
+    "pass1_error": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'"
+  },
+  {
+    "module": "tx_tail_vs_tx_in_p",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "rms_error": 0.0,
+      "correlation": 0.0,
+      "coverage": 0.0
+    },
+    "error_msg": null,
+    "pass1_error": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'"
+  },
+  {
+    "module": "rx_out_n_vs_tx_in_p",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {},
+    "error_msg": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'",
+    "pass1_error": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'"
+  },
+  {
+    "module": "rx_tail_vs_tx_in_p",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "rms_error": 0.0,
+      "correlation": 0.0,
+      "coverage": 0.0
+    },
+    "error_msg": null,
+    "pass1_error": null
+  },
+  {
+    "module": "tx_out_p_vs_tx_in_p",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "rms_error": 0.0,
+      "correlation": 0.0,
+      "coverage": 0.0
+    },
+    "error_msg": null,
+    "pass1_error": null
+  },
+  {
+    "module": "tx_out_n_vs_tx_in_n",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {},
+    "error_msg": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'",
+    "pass1_error": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'"
+  },
+  {
+    "module": "rx_out_p_vs_tx_in_n",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {},
+    "error_msg": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'",
+    "pass1_error": null
+  },
+  {
+    "module": "tx_tail_vs_tx_in_n",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "rms_error": 0.0,
+      "correlation": 0.0,
+      "coverage": 0.0
+    },
+    "error_msg": null,
+    "pass1_error": null
+  },
+  {
+    "module": "rx_out_n_vs_tx_in_n",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "rms_error": 0.0,
+      "correlation": 0.0,
+      "coverage": 0.0
+    },
+    "error_msg": null,
+    "pass1_error": null
+  },
+  {
+    "module": "rx_tail_vs_tx_in_n",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "rms_error": 0.0,
+      "correlation": 0.0,
+      "coverage": 0.0
+    },
+    "error_msg": null,
+    "pass1_error": null
+  },
+  {
+    "module": "tx_out_p_vs_tx_in_n",
+    "pass1": "failed",
+    "validation": "failed",
+    "pass3": "failed",
+    "final": "baseline_fallback",
+    "metrics": {},
+    "error_msg": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'",
+    "pass1_error": "Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'"
+  }
+]

@@ -2,8 +2,10 @@
 * Simple NMOS transistor with DC sweep on gate voltage
 
 * Circuit (from ams-net.github.io/amsnet_1.0/0/0.cir)
+* Fixed: Added load resistor so vd actually varies with vg
 M1 vd vg 0 0 NMOS W=1u L=1u
-VDD vd 0 DC 1.8V
+VDD vdd 0 DC 1.8V
+RD vdd vd 10k
 VGS vg 0 DC 0V
 
 * NMOS model (Level 1 - simple)

@@ -23,7 +23,7 @@ import math
 import numpy as np
 from pathlib import Path
 from ngspice_runner import NgspiceRunner, NgspiceError
-from ai_agent import create_agent, generate, refine, compute_nrmse, evaluate_va_code
+from ai_agent import create_agent, generate, refine, compute_nrmse, evaluate_va_code, clean_code
 
 try:
     from spice_flatten import flatten_netlist as _flatten_netlist
@@ -958,6 +958,7 @@ def run_pipeline(netlist_text, output_dir=".",
     agent   = create_agent(provider=provider, model=ai_model)
     va_code = generate(agent, netlist_text, x, y, info,
                        metrics=metrics, ac_metrics=ac_metrics)
+    va_code = clean_code(va_code)  # Strip LLM preamble and fix syntax
 
     final_nrmse = None
     if x is not None and y is not None:
@@ -981,6 +982,7 @@ def run_pipeline(netlist_text, output_dir=".",
                 if i < max_iterations - 1:
                     va_code = refine(agent, netlist_text, x, y, info,
                                      va_code, nrmse)
+                    va_code = clean_code(va_code)  # Clean after each refinement
     else:
         print("      (no simulation data — skipping NRMSE evaluation)")
 

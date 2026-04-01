@@ -90,33 +90,52 @@ def detect_capabilities() -> dict:
 
     # ── ngspice OSDI support ──────────────────────────────────────────────────
     # OSDI is loaded via 'osdi /path/model.osdi' inside a .control block.
-    # A custom OSDI-enabled binary is at ~/.local/bin/ngspice-osdi (built from
-    # source with ./configure --enable-osdi).  The Homebrew bottle lacks this.
+    # First check custom OSDI-enabled binary at ~/.local/bin/ngspice-osdi
+    # Then fallback to system ngspice and test if it has OSDI support
     OSDI_NGSPICE_BIN = str(Path.home() / ".local" / "bin" / "ngspice-osdi")
     osdi_bin_exists = Path(OSDI_NGSPICE_BIN).exists()
+
     if osdi_bin_exists:
         osdi_test = subprocess.run(
             [OSDI_NGSPICE_BIN, "-b"],
             input=".title osdi_probe\n.control\nosdi /dev/null\n.endc\n.end\n",
             capture_output=True, text=True
         )
-        # 'osdi' command recognized → no "unimplemented" error (dlopen failure is fine)
         osdi_ngspice = "unimplemented dot command" not in osdi_test.stderr.lower()
+        osdi_bin_used = OSDI_NGSPICE_BIN
     else:
-        osdi_ngspice = False
+        # Test system ngspice for OSDI support
+        if ngspice_bin:
+            osdi_test = subprocess.run(
+                [ngspice_bin, "-b"],
+                input=".title osdi_probe\n.control\nosdi /dev/null\n.endc\n.end\n",
+                capture_output=True, text=True
+            )
+            osdi_ngspice = "unimplemented dot command" not in osdi_test.stderr.lower()
+            osdi_bin_used = ngspice_bin if osdi_ngspice else "ngspice"
+        else:
+            osdi_ngspice = False
+            osdi_bin_used = "ngspice"
+
     caps["ngspice_osdi"] = osdi_ngspice
-    caps["osdi_ngspice_bin"] = OSDI_NGSPICE_BIN if osdi_ngspice else "ngspice"
-    _cap_line(
-        "ngspice OSDI support (osdi command in .control)",
-        osdi_ngspice,
-        ok_detail=f"OSDI-enabled binary at {OSDI_NGSPICE_BIN}",
-        fail_detail=(
-            f"OSDI-enabled ngspice not found at {OSDI_NGSPICE_BIN}. "
-            "The Homebrew bottle lacks --enable-osdi. "
-            "Build: download ngspice source, ./configure --enable-osdi, make. "
-            "Copy binary to ~/.local/bin/ngspice-osdi."
-        ),
-    )
+    caps["osdi_ngspice_bin"] = osdi_bin_used
+
+    if osdi_ngspice:
+        _cap_line(
+            "ngspice OSDI support (osdi command in .control)",
+            True,
+            ok_detail=f"OSDI-enabled ngspice at {osdi_bin_used}",
+        )
+    else:
+        _cap_line(
+            "ngspice OSDI support (osdi command in .control)",
+            False,
+            fail_detail=(
+                f"OSDI-enabled ngspice not found. "
+                "Build from source: ./configure --enable-osdi, make, "
+                "cp src/ngspice ~/.local/bin/ngspice-osdi"
+            ),
+        )
 
     # ── OpenVAF ──────────────────────────────────────────────────────────────
     # Check both PATH and ~/.local/bin (where cargo installs to)
@@ -141,9 +160,18 @@ def detect_capabilities() -> dict:
     )
 
     # ── AI agent (Ollama or Anthropic) ───────────────────────────────────────
-    ollama_ok = bool(
+    # Check for local ollama binary
+    ollama_bin = bool(
         subprocess.run(["which", "ollama"], capture_output=True).stdout.strip()
     )
+    # Check for remote Ollama via OllamaAgent.is_available()
+    try:
+        from ai_agent import OllamaAgent  # noqa: PLC0415
+        ollama_remote = OllamaAgent.is_available()
+    except Exception:
+        ollama_remote = False
+
+    ollama_ok = ollama_bin or ollama_remote
     anthropic_key = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
     caps["ai_agent"] = ollama_ok or anthropic_key
 
@@ -151,8 +179,12 @@ def detect_capabilities() -> dict:
         ai_detail = "Ollama + ANTHROPIC_API_KEY (will use ANTHROPIC_API_KEY)"
     elif anthropic_key:
         ai_detail = "ANTHROPIC_API_KEY set"
-    elif ollama_ok:
-        ai_detail = "Ollama found (will use Ollama)"
+    elif ollama_remote:
+        from ai_agent import OllamaAgent  # noqa: PLC0415
+        agent = OllamaAgent()
+        ai_detail = f"Remote Ollama @ {agent.base_url} (model: {agent.model})"
+    elif ollama_bin:
+        ai_detail = "Ollama found (local)"
     else:
         ai_detail = (
             "neither Ollama nor ANTHROPIC_API_KEY found — "
@@ -563,24 +595,57 @@ _OSDI_TESTBENCH_TEMPLATE = """\
 
 .title OSDI validation {module_name}
 
+* ── Load OSDI library and define model ────────────────────────────
+.control
+pre_osdi {osdi_path}
+.endc
+
+* ── Define model mapping (model instance -> Verilog-A module) ──────
+.model behavioral_model {module_name}
+
 * ── Golden SPICE circuit ────────────────────────────────────────────
 {netlist_body}
 
 * ── Behavioral model under test ────────────────────────────────────
-X_model {signal_source} {output_node}_model {module_name}
+* Note: Uses N-device (OSDI device) with model defined above
+* Device syntax: N<name> <nodes...> <model_instance_name>
+N_model {signal_node} {output_node}_model behavioral_model
 
 * ── DC sweep ────────────────────────────────────────────────────────
 .DC {signal_source} {dc_start} {dc_stop} {dc_step}
 
 .control
-* Load OSDI model (must happen before run in batch mode)
-osdi {osdi_path}
 run
 print v({output_node}) v({output_node}_model)
 .endc
 
 .END
 """
+
+def _find_node_for_source(netlist: str, source_name: str) -> str:
+    """
+    Find the node name connected to a voltage/current source.
+
+    Args:
+        netlist: SPICE netlist text
+        source_name: Source device name (e.g., "VGS", "Vin")
+
+    Returns:
+        str: Node name (e.g., "vg", "in") or original source_name if not found
+    """
+    for line in netlist.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('*') or line.startswith('.'):
+            continue
+        tokens = line.split()
+        if len(tokens) < 3:
+            continue
+        # V/I source format: <name> <node+> <node-> <value>
+        # We want the positive node (node+)
+        if tokens[0].upper() == source_name.upper():
+            return tokens[1]
+    return source_name
+
 
 def test4_osdi(netlist_text: str, output_dir: Path, caps: dict,
                va_code: str, x, y, info) -> dict:
@@ -644,13 +709,18 @@ def test4_osdi(netlist_text: str, output_dir: Path, caps: dict,
         netlist_lines.append(line)
     netlist_body = "\n".join(netlist_lines)
 
+    # Map source name to node name for behavioral model instantiation
+    # Behavioral models expect node names (e.g., "vg") but DC sweeps use source names (e.g., "VGS")
+    signal_node = _find_node_for_source(netlist_text, info["signal_source"])
+
     x_range = x[-1] - x[0]
     dc_step = x_range / max(len(x) - 1, 1)
     testbench = _OSDI_TESTBENCH_TEMPLATE.format(
         module_name=module_name,
         osdi_path=str(osdi_path),
         netlist_body=netlist_body,
-        signal_source=info["signal_source"],
+        signal_source=info["signal_source"],  # Keep original for .DC command
+        signal_node=signal_node,               # Use node name for X_model
         output_node=info["output_node"],
         dc_start=f"{x[0]:.4f}",
         dc_stop=f"{x[-1]:.4f}",

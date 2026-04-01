@@ -1,0 +1,340 @@
+● You're absolutely right! I was being too reductive. Let me reconsider...
+
+  Why Programmatic Translation is Actually Insufficient
+
+  You're correct about custom net types - this is where it gets semantically complex:
+
+  Example: Custom Differential Discipline
+
+  User's convention:
+  // User has custom differential type
+  discipline differential_pair
+    potential voltage_diff;
+  enddiscipline
+
+  // User's amplifier style:
+  module diff_amp(
+    input differential_pair in,
+    output electrical out
+  );
+    analog begin
+      V(out) <+ gain * V(in);  // V(in) automatically gets differential voltage
+    end
+  endmodule
+
+  Baseline from programmatic pipeline:
+  module diff_amp(
+    input electrical in_p,
+    input electrical in_n,
+    output electrical out
+  );
+    analog begin
+      real v_diff;
+      v_diff = V(in_p) - V(in_n);
+      V(out) <+ gain * v_diff;
+    end
+  endmodule
+
+  The translation problem:
+  - Can't just replace electrical with differential_pair
+  - Need to restructure: merge two ports into one
+  - Need to refactor code: remove v_diff calculation (implicit in custom type)
+  - Need to understand semantics: which ports form a pair?
+
+  This requires semantic reasoning, not just pattern matching.
+
+  ---
+  Why AI is Actually Necessary
+
+  1. Port Pairing is Semantic
+
+  # Programmatic approach:
+  ports = ['in_p', 'in_n', 'vdd', 'vss', 'out']
+
+  # How does programmatic code know:
+  # - in_p and in_n are a differential pair?
+  # - vdd and vss are power rails (not differential)?
+  # - out is single-ended?
+
+  AI can infer this from examples:
+  User's examples show: _p/_n suffixes → differential_pair
+  User's examples show: vdd/vss → power_rail discipline
+  User's examples show: single output → electrical
+
+  2. Abstraction Level Changes
+
+  User might prefer:
+  // High-level abstraction
+  V(out) <+ laplace_nd(V(in), {0, 1e6}, {1, 1e3});
+
+  // Instead of programmatic's detailed RC network:
+  I(c1) <+ C1 * ddt(V(c1));
+  I(r1) <+ V(r1) / R1;
+  // ... 10 more lines
+
+  Programmatic can't decide: "Should I collapse these 10 lines into one laplace_nd call?"
+  AI can see: "User's examples always use laplace_nd for first-order filters"
+
+  3. User-Specific Idioms
+
+  // User always wraps saturated outputs like this:
+  module output_stage(...);
+    real v_raw, v_limited;
+    analog begin
+      v_raw = gain * V(in);
+      v_limited = limit_symmetric(v_raw, VDD/2);  // Custom helper
+      V(out) <+ v_limited;
+    end
+  endmodule
+
+  Programmatic would need explicit rule: "When you see saturation, call limit_symmetric()"
+  AI learns from examples: "User always uses limit_symmetric for output clamping"
+
+  ---
+  The Right Architecture: Programmatic + AI (with Safety)
+
+  You're right - we need both:
+
+  ┌─────────────────────────────────────────────────┐
+  │  Phase 1: Accurate Baseline (Programmatic)      │
+  │  → Guarantees functional correctness            │
+  └─────────────────────────────────────────────────┘
+           ↓
+  ┌─────────────────────────────────────────────────┐
+  │  Phase 2: Semantic Translation (AI)             │
+  │  → Learns from user examples                    │
+  │  → Applies custom types & abstractions          │
+  │  → Uses baseline as "reference implementation"  │
+  └─────────────────────────────────────────────────┘
+           ↓
+  ┌─────────────────────────────────────────────────┐
+  │  Phase 3: Equivalence Validation                │
+  │  → Compile both models                          │
+  │  → Run identical testbench                      │
+  │  → Verify error < threshold                     │
+  │  → If fail → retry with constraints             │
+  └─────────────────────────────────────────────────┘
+
+  Refined AI Translation Prompt (Baseline as Reference)
+
+  def build_ai_translation_prompt(baseline_code, user_examples, netlist):
+      prompt = f"""# Task: Semantic Code Translation
+
+  You are translating a FUNCTIONALLY CORRECT Verilog-AMS model to match the user's coding conventions and custom abstractions.
+
+  ## BASELINE MODEL (Reference Implementation - MUST preserve this exact behavior):
+
+  ```verilog
+  {baseline_code}
+
+  This model is your REFERENCE for functionality. You must produce a model with IDENTICAL electrical behavior.
+
+  ---
+  USER'S CODING STYLE (Learn from these examples):
+
+  """
+
+  # Add user's examples with annotations
+  for ex in user_examples[:3]:
+      prompt += f"""
+  Example: {ex['name']}
+
+  {ex['code']}
+
+  Key patterns to notice:
+  - Custom disciplines: {identify_custom_types(ex['code'])}
+  - Port organization: {identify_port_pattern(ex['code'])}
+  - Modeling style: {identify_modeling_style(ex['code'])}
+
+  """
+
+  prompt += f"""
+  ---
+  ORIGINAL CIRCUIT (for context):
+
+  {netlist}
+
+  ---
+  YOUR TASK:
+
+  Rewrite the BASELINE MODEL to match the USER'S STYLE while preserving exact functionality.
+
+  Specific translation rules:
+
+  1. Port restructuring:
+    - If baseline has separate ports like in_p, in_n and user examples use custom differential_pair type
+    - Convert to single port: input differential_pair in
+    - Remove explicit differential calculation (implicit in discipline)
+  2. Modeling abstractions:
+    - If user examples use laplace_nd() for filters, convert RC networks to laplace_nd
+    - If user examples use custom saturation functions, use those instead of min/max
+    - If user examples group functionality differently, match that structure
+  3. Discipline mapping:
+    - Map electrical to user's custom disciplines where semantically appropriate
+    - Differential signals → differential_pair (if user has this)
+    - Power/ground → power_rail (if user has this)
+    - Single-ended → electrical
+  4. Parameter organization:
+    - Group parameters like user's examples
+    - Use user's naming conventions
+    - Add same comments/annotations
+
+  Critical constraints:
+  ✓ MUST preserve exact I/O behavior of baseline
+  ✓ MUST compile successfully
+  ✓ MUST use user's custom types appropriately
+  ✗ DO NOT add functionality not in baseline
+  ✗ DO NOT change mathematical relationships
+  ✗ DO NOT remove accuracy
+
+  Output format:
+  Return ONLY the translated Verilog-AMS code. No explanations, no markdown fences.
+  """
+
+  return prompt
+
+  ## Key Insight: AI Does What Programmatic Can't
+
+  | Task | Programmatic | AI |
+  |------|-------------|-----|
+  | Generate accurate model | ✓ Excellent | ✗ Unreliable |
+  | String replacement | ✓ Perfect | ✓ Good |
+  | Understand port semantics | ✗ Very hard | ✓ Excellent |
+  | Learn from examples | ✗ Requires manual rules | ✓ Few-shot learning |
+  | Restructure code | ✗ Needs full AST + rules | ✓ Pattern matching |
+  | Map abstractions | ✗ Brittle | ✓ Flexible |
+  | **Preserve functionality** | ✓ Guaranteed | ✗ **Needs validation** |
+
+  **The synergy:**
+  - Programmatic gives **ground truth** (functional correctness)
+  - AI provides **flexibility** (semantic understanding)
+  - Validation gives **safety net** (catches AI errors)
+
+  ---
+
+  ## Concrete Example: Differential Pair Translation
+
+  **Baseline (programmatic output):**
+  ```verilog
+  `include "disciplines.vams"
+
+  module diff_amp(
+      input electrical vin_p,
+      input electrical vin_n,
+      output electrical vout
+  );
+      parameter real gain = 10.0;
+      parameter real voh = 5.0;
+      parameter real vol = 0.0;
+
+      analog begin
+          real v_diff, v_out;
+
+          v_diff = V(vin_p) - V(vin_n);
+          v_out = gain * v_diff;
+
+          // Saturation
+          v_out = min(voh, max(vol, v_out));
+
+          V(vout) <+ v_out;
+      end
+  endmodule
+
+  User's example (shows their style):
+  `include "my_disciplines.vams"
+
+  module my_other_amp(
+      input diff_signal in,
+      output electrical out
+  );
+      parameter real Gain = 12.0;
+      parameter real Voh = 3.3;
+      parameter real Vol = 0.0;
+
+      analog begin
+          V(out) <+ saturate(Gain * V(in), Vol, Voh);
+      end
+  endmodule
+
+  AI translation (learns from example):
+  `include "my_disciplines.vams"
+
+  module diff_amp(
+      input diff_signal vin,  // ← Merged vin_p, vin_n
+      output electrical vout
+  );
+      parameter real Gain = 10.0;  // ← Matched capitalization
+      parameter real Voh = 5.0;
+      parameter real Vol = 0.0;
+
+      analog begin
+          // ← Removed v_diff calculation (implicit)
+          // ← Used saturate() function like user's example
+          V(vout) <+ saturate(Gain * V(vin), Vol, Voh);
+      end
+  endmodule
+
+  Why this needed AI:
+  1. Recognized vin_p, vin_n form differential pair → use diff_signal
+  2. Learned user capitalizes parameters → changed gain to Gain
+  3. Noticed user uses saturate() helper → mapped min(max()) to that
+  4. Simplified code structure to match user's concise style
+
+  Programmatic rules would need:
+  if port_name.endswith('_p') and exists(port_name.replace('_p', '_n')):
+      merge_to_differential_pair(...)
+  if user_has_function('saturate'):
+      replace_minmax_with_saturate(...)
+  # ... hundreds more rules for edge cases
+
+  ---
+  Validation: The Safety Net
+
+  The critical part: Equivalence checking catches AI mistakes
+
+  # After AI translation
+  result = equivalence_checker.compare(baseline_va, adapted_va, test_vectors)
+
+  if result.max_error > 0.001:  # More than 0.1% error
+      # AI broke something - retry with stricter constraints
+
+      prompt += f"""
+
+      ⚠️ VALIDATION FAILED - Your previous translation had errors:
+
+      Failing test points:
+      {format_failing_points(result.failing_points)}
+
+      The issue is likely:
+      - Incorrect port mapping
+      - Wrong discipline semantics
+      - Missing functionality
+
+      Retry the translation, being MORE CONSERVATIVE:
+      - Keep exact same math
+      - Only change types/names, not logic
+      - Verify each transformation preserves behavior
+      """
+
+      adapted_va = ai.retry_translation(prompt)
+
+  ---
+  My Revised Recommendation
+
+  Use the AI-based semantic translation approach because:
+
+  1. ✓ User conventions ARE semantically complex (custom types, abstractions)
+  2. ✓ AI excels at pattern matching from examples
+  3. ✓ Programmatic baseline ensures we have correct reference
+  4. ✓ Equivalence validation catches AI errors
+  5. ✓ Much simpler than building comprehensive rule engine
+
+  Implementation priority:
+  1. Week 1: Programmatic baseline (already exists!)
+  2. Week 2: AI translation with few-shot examples
+  3. Week 3: Equivalence validation & refinement loop
+  4. Week 4: Polish & edge case handling
+
+  This gives you flexibility (AI) with safety (validation).
+
+  Would you like me to implement the AI-based translation system with the programmatic baseline + validation architecture?

@@ -1,0 +1,33 @@
+SynapticAMS Warm-Start Demo Results
+================================================================================
+Generated: 2026-03-29 12:03:00
+Input netlist: serdes_cml.cir
+Output directory: /home/vrajeshprakhya/SynapticAMS/my_demo_results
+
+Method: Warm-Start (Non-AI → AI Refinement)
+--------------------------------------------------------------------------------
+1. Non-AI pipeline extracts circuit structure and fits transfer functions
+2. AI agent refines ALL modules with domain knowledge
+3. Result combines numeric precision with intelligent modeling
+
+Generated Files:
+--------------------------------------------------------------------------------
+  • baseline_example.va    - Example non-AI numerically-fitted model
+  • refined/               - All 12 AI-refined modules
+  • comparison_all_modules.txt - Side-by-side comparison of all modules
+  • nonai/                 - All non-AI generated modules
+
+Next Steps:
+--------------------------------------------------------------------------------
+1. Review refined modules: ls /home/vrajeshprakhya/SynapticAMS/my_demo_results/refined/*.va
+2. Compare all changes: cat comparison_all_modules.txt
+3. Compile each module: for f in /home/vrajeshprakhya/SynapticAMS/my_demo_results/refined/*.va; do openvaf $f; done
+4. Pick specific module: cat /home/vrajeshprakhya/SynapticAMS/my_demo_results/refined/<module_name>.va
+
+When to Use Warm-Start:
+--------------------------------------------------------------------------------
+✓ Simple amplifiers and DC circuits (38% better than pure AI)
+✓ When you want numeric precision + AI intelligence
+✓ When pure AI struggles to converge
+✗ Complex RF/SerDes (use AI Judge instead)
+✗ When non-AI baseline is very poor

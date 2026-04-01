@@ -335,7 +335,8 @@ class SimulationPlanner:
         # Convert to SPICE names
         sweep_var1 = src1.replace("net:", "")
         sweep_var2 = src2.replace("net:", "")
-        observe_vars = [n.replace("net:", "") for n in outputs]
+        # Exclude sweep variables from observe list (they're handled separately)
+        observe_vars = [n.replace("net:", "") for n in outputs if n not in {src1, src2}]
 
         return [{
             'type': 'dc_sweep_2d',

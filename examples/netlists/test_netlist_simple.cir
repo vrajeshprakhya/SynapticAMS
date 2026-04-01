@@ -1,9 +1,10 @@
 * NMOS DC Sweep Example (Clean version for programmatic pipeline)
 * Simple NMOS transistor with DC sweep on gate voltage
 
-* Circuit
+* Circuit (Fixed: Added load resistor)
 M1 vd vg 0 0 NMOS W=1u L=1u
-VDD vd 0 DC 1.8V
+VDD vdd 0 DC 1.8V
+RD vdd vd 10k
 VGS vg 0 DC 0V
 
 * NMOS model (Level 1 - simple)

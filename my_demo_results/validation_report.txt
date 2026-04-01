@@ -1,0 +1,136 @@
+================================================================================
+AI Refinement Validation Report
+================================================================================
+
+Module: tx_out_n_vs_tx_in_p
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  Final Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+  Pass 1 Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+
+Module: rx_out_p_vs_tx_in_p
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  Final Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+  Pass 1 Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+
+Module: tx_tail_vs_tx_in_p
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  SPICE/EC Validation Metrics:
+    Max Absolute Error: 0.000000e+00
+    Max Relative Error: 0.00%
+    RMS Error:          0.000000e+00
+    Correlation:        0.000000
+    Coverage:           0.0%
+  Pass 1 Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+
+Module: rx_out_n_vs_tx_in_p
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  Final Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+  Pass 1 Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+
+Module: rx_tail_vs_tx_in_p
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  SPICE/EC Validation Metrics:
+    Max Absolute Error: 0.000000e+00
+    Max Relative Error: 0.00%
+    RMS Error:          0.000000e+00
+    Correlation:        0.000000
+    Coverage:           0.0%
+
+Module: tx_out_p_vs_tx_in_p
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  SPICE/EC Validation Metrics:
+    Max Absolute Error: 0.000000e+00
+    Max Relative Error: 0.00%
+    RMS Error:          0.000000e+00
+    Correlation:        0.000000
+    Coverage:           0.0%
+
+Module: tx_out_n_vs_tx_in_n
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  Final Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+  Pass 1 Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+
+Module: rx_out_p_vs_tx_in_n
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  Final Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+
+Module: tx_tail_vs_tx_in_n
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  SPICE/EC Validation Metrics:
+    Max Absolute Error: 0.000000e+00
+    Max Relative Error: 0.00%
+    RMS Error:          0.000000e+00
+    Correlation:        0.000000
+    Coverage:           0.0%
+
+Module: rx_out_n_vs_tx_in_n
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  SPICE/EC Validation Metrics:
+    Max Absolute Error: 0.000000e+00
+    Max Relative Error: 0.00%
+    RMS Error:          0.000000e+00
+    Correlation:        0.000000
+    Coverage:           0.0%
+
+Module: rx_tail_vs_tx_in_n
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  SPICE/EC Validation Metrics:
+    Max Absolute Error: 0.000000e+00
+    Max Relative Error: 0.00%
+    RMS Error:          0.000000e+00
+    Correlation:        0.000000
+    Coverage:           0.0%
+
+Module: tx_out_p_vs_tx_in_n
+  Pass 1 (AI refinement): failed
+  Pass 2 (Validation): failed
+  Pass 3 (Error correction): failed
+  Final version: baseline_fallback
+
+  Final Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+  Pass 1 Error: Transient validation error: OSDIEquivalenceChecker.check_transient_equivalence() got an unexpected keyword argument 'output_nodes'
+

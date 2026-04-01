@@ -27,7 +27,7 @@ import re
 
 # OSDI equivalence checking is optional (requires OpenVAF)
 try:
-    from equivalence_checker_osdi import OSDIEquivalenceChecker
+    from equivalence_checker.equivalence_checker_osdi import OSDIEquivalenceChecker
     OSDI_AVAILABLE = True
 except ImportError:
     OSDI_AVAILABLE = False
@@ -230,8 +230,18 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
 
             try:
                 results = runner.dc_sweep_2d(netlist_text, plan)
+
+                # Debug: Print ALL variables in results
+                print(f"\n          DEBUG: dc_sweep_2d returned {len(results)} variables:")
+                for key, val in results.items():
+                    if hasattr(val, 'shape'):
+                        print(f"            {key}: shape={val.shape}, size={val.size}")
+                    else:
+                        print(f"            {key}: type={type(val)}")
+
                 n1 = len(results[sweep_var_1])
                 n2 = len(results[sweep_var_2])
+                print(f"          n1={n1}, n2={n2}, expected_points={n1*n2}")
                 print(f" ✓ {n1}×{n2} grid")
 
                 simulation_results.append({
@@ -459,6 +469,20 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
                 print(f"        {obs_var} = f({sweep_var_1}, {sweep_var_2})", end="")
 
                 try:
+                    # Validate and reshape 2D data
+                    expected_shape = (len(x1), len(x2))
+
+                    # If z is 1D, try to reshape it
+                    if z.ndim == 1:
+                        if len(z) == len(x1) * len(x2):
+                            z = z.reshape(expected_shape)
+                        else:
+                            raise ValueError(f"Data shape mismatch: z has {len(z)} points, expected {len(x1)}×{len(x2)}={len(x1)*len(x2)}")
+
+                    # Verify 2D shape matches
+                    if z.shape != expected_shape:
+                        raise ValueError(f"Data shape mismatch: z.shape={z.shape}, expected {expected_shape}")
+
                     from pipeline_ext.fit_transfer_function import fit_transfer_function_2d
                     model = fit_transfer_function_2d(x1, x2, z)
 
@@ -725,12 +749,16 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
     generator = VerilogAMSGenerator()
 
     for fitted_model in fitted_models:
-        module_name = f"{fitted_model['output']}_vs_{fitted_model['input']}"
-        module_name = module_name.replace(':', '_')
+        # Let verilog_ams_generator.py generate the module name properly
+        # (handles 2D models correctly by joining input list with underscores)
+        code = generator.generate_module(fitted_model, module_name=None)
+
+        # Extract the generated module name from the code for display
+        import re
+        match = re.search(r'\bmodule\s+(\w+)', code)
+        module_name = match.group(1) if match else "unknown"
 
         print(f"      Module: {module_name}")
-
-        code = generator.generate_module(fitted_model, module_name)
 
         # Show snippet
         for line in code.split('\n'):
@@ -767,6 +795,11 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
             input_names = [fitted_model['input'].replace('net:', '')]
 
         module_name = module_name.replace(':', '_').replace('net:', '')
+
+        # Ensure module name starts with letter or underscore (not digit)
+        # Verilog-AMS identifiers cannot start with digits
+        if module_name and module_name[0].isdigit():
+            module_name = 'n' + module_name
 
         # Get the generated code
         code = generator.generate_module(fitted_model, module_name)
@@ -881,7 +914,7 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
                         else:
                             print(f"      ⚠ {module_name}: oscillator SPICE simulation failed")
                     else:
-                        # Use regular OSDI checker for non-oscillator models
+                        # Use regular OSDI checker for non-oscillator models (includes 2D support)
                         mode_desc = f" (using {validation_mode} mode)" if validation_mode == 'transient' else ""
 
                         result = osdi_checker.check_equivalence(

@@ -393,6 +393,18 @@ def clean_code(text):
     """Strip markdown fences and fix common Ollama Verilog-AMS syntax errors."""
     text = re.sub(r"```(?:verilog(?:-ams)?|vams)?\n?", "", text, flags=re.I)
     text = text.strip()
+
+    # Strip everything before the first valid Verilog-AMS token (`include or module)
+    # LLMs often add preamble like "Here is a Verilog-AMS model:"
+    first_valid = re.search(r'(`include|module)\b', text)
+    if first_valid:
+        text = text[first_valid.start():]
+
+    # Strip everything after endmodule (LLMs often add explanations)
+    endmodule_match = re.search(r'\bendmodule\b', text)
+    if endmodule_match:
+        text = text[:endmodule_match.end()].strip()
+
     # Fix missing backtick before `include (e.g. include "disciplines.vams")
     text = re.sub(r'^(\s*)include\s+"', r'\1`include "', text, flags=re.M)
     # Fix module declaration missing semicolon (e.g. module foo(out, in)\n)
@@ -405,14 +417,63 @@ def clean_code(text):
         post = text[analog_idx:]
         pre = re.sub(r'^(\s*)real\s+(\w+)\s*=\s*', r'\1parameter real \2 = ', pre, flags=re.M)
         text = pre + post
+
+    # Fix missing port directions for OpenVAF compatibility
+    # OpenVAF requires explicit input/output declarations
+    # Pattern: module foo(out, in); \n  electrical out, in;
+    # Should add: input in; output out; after module declaration
+    module_match = re.search(r'module\s+\w+\s*\(([^)]+)\)\s*;', text)
+    if module_match:
+        ports = [p.strip() for p in module_match.group(1).split(',')]
+        # Find the electrical declaration line
+        elec_match = re.search(r'(\s*)electrical\s+([^;]+);', text)
+        if elec_match and ports:
+            # Check if port directions already exist (to avoid duplicates)
+            # Look for 'output <portname>;' or 'input <portname>;' before electrical declaration
+            pre_electrical = text[:elec_match.start()]
+            has_directions = any(
+                re.search(rf'\b(input|output)\s+{re.escape(port)}\s*;', pre_electrical)
+                for port in ports
+            )
+
+            if not has_directions:
+                # Assume first port is output, rest are inputs (common convention)
+                # This matches the typical pattern: module foo(out, in1, in2)
+                indent = elec_match.group(1)
+                directions = []
+                if len(ports) > 0:
+                    directions.append(f"output {ports[0]};")
+                for port in ports[1:]:
+                    directions.append(f"input {port};")
+
+                # Insert direction declarations before electrical declaration
+                direction_block = indent + f'\n{indent}'.join(directions) + '\n'
+                text = text[:elec_match.start()] + direction_block + text[elec_match.start():]
+
+    # Ensure `include "disciplines.vams" is always present at the beginning
+    # OpenVAF requires this header for electrical net types
+    if not re.search(r'`include\s+"disciplines\.vams"', text):
+        # Check if there's already an `include "constants.vams"
+        if re.search(r'`include\s+"constants\.vams"', text):
+            # Insert disciplines.vams before constants.vams
+            text = re.sub(
+                r'(`include\s+"constants\.vams")',
+                r'`include "disciplines.vams"\n\1',
+                text,
+                count=1
+            )
+        else:
+            # Insert at the very beginning
+            text = '`include "disciplines.vams"\n' + text
+
     return text
 
 
 # ── Ollama backend ─────────────────────────────────────────────────────
 
 class OllamaAgent:
-    DEFAULT_MODEL = "qwen2.5-coder:7b"
-    BASE_URL      = "http://localhost:11434"
+    DEFAULT_MODEL = "deepseek-r1:32b"
+    BASE_URL      = "http://192.168.1.34:11434"  # Remote Ollama server
 
     def __init__(self, model=None, base_url=None, timeout=180):
         self.model    = model    or self.DEFAULT_MODEL

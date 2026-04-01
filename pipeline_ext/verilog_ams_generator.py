@@ -22,6 +22,16 @@ class VerilogAMSGenerator:
     def __init__(self):
         self.generated_modules = []
 
+    def _sanitize_identifier(self, name):
+        """
+        Sanitize identifier to ensure it's valid for Verilog-AMS.
+        Verilog identifiers must start with letter or underscore, not digit.
+        """
+        name = name.replace('net:', '').replace(':', '_').replace('v(', '').replace(')', '')
+        if name and name[0].isdigit():
+            name = 'n' + name
+        return name
+
     def generate_module(self, fitted_model, module_name=None):
         """
         Generate Verilog-AMS module from fitted model
@@ -39,18 +49,26 @@ class VerilogAMSGenerator:
         output_name = fitted_model['output']
         model = fitted_model['model']
 
-        # Check if this is a 2D model (input is a list)
+        # Check if this is a 2D model (input is a list) or autonomous (input is None)
         is_2d = isinstance(input_name, list)
+        is_autonomous = (input_name is None)
 
         if module_name is None:
             # Auto-generate name: output_vs_input
-            if is_2d:
+            if is_autonomous:
+                # Autonomous oscillator - no input
+                module_name = f"{output_name}_oscillator"
+            elif is_2d:
                 input_str = '_'.join(input_name)
                 module_name = f"{output_name}_vs_{input_str}"
             else:
                 module_name = f"{output_name}_vs_{input_name}"
-            # Clean up net: prefix
+            # Clean up net: prefix and sanitize for Verilog identifiers
             module_name = module_name.replace('net:', '').replace(':', '_')
+            # Ensure module name starts with letter or underscore (not digit)
+            # Verilog-AMS identifiers cannot start with digits
+            if module_name and module_name[0].isdigit():
+                module_name = 'n' + module_name
 
         if model['model_type'] == 'analytic':
             if is_2d:
@@ -83,7 +101,7 @@ class VerilogAMSGenerator:
             )
         elif model['model_type'] == 'dynamic':
             code = self._generate_dynamic_module(
-                module_name, input_name, output_name, model, fitted_model.get('data', {})
+                module_name, input_name, output_name, model, fitted_model['data']
             )
         else:
             raise ValueError(f"Unknown model type: {model['model_type']}")
@@ -111,9 +129,9 @@ class VerilogAMSGenerator:
         x_min, x_max = x.min(), x.max()
         y_min, y_max = y.min(), y.max()
 
-        # Clean names (remove net: prefix)
-        input_clean = input_name.replace('net:', '')
-        output_clean = output_name.replace('net:', '')
+        # Clean names (remove net: prefix and sanitize for Verilog)
+        input_clean = self._sanitize_identifier(input_name)
+        output_clean = self._sanitize_identifier(output_name)
 
         # Generate header
         code = self._generate_header(module_name, model)
@@ -159,7 +177,8 @@ class VerilogAMSGenerator:
         Generate smooth tanh-blended transfer function code
         """
         code = ""
-        code += "        real w_active, y_off, y_on, y_out;\n\n"
+        code += "        real w_active, y_off, y_on, y_out;\n"
+        code += "        parameter real output_resistance = 1.0;  // Output resistance (Ohms) for numerical stability\n\n"
 
         # Smoothing function
         Vth = smoothing['center']
@@ -182,7 +201,8 @@ class VerilogAMSGenerator:
         code += "        // Smooth blend between regions\n"
         code += "        y_out = (1.0 - w_active) * y_off + w_active * y_on;\n\n"
 
-        code += f"        V({output_name}) <+ y_out;\n"
+        code += "        // Use current source with output resistance (Thevenin equivalent)\n"
+        code += f"        I({output_name}) <+ (y_out - V({output_name})) / output_resistance;\n"
 
         return code
 
@@ -191,7 +211,8 @@ class VerilogAMSGenerator:
         Generate hard piecewise code (fallback)
         """
         code = ""
-        code += "        real y_out;\n\n"
+        code += "        real y_out;\n"
+        code += "        parameter real output_resistance = 1.0;  // Output resistance (Ohms) for numerical stability\n\n"
 
         for i, region in enumerate(regions):
             if i == 0:
@@ -213,7 +234,8 @@ class VerilogAMSGenerator:
             expr = self._translate_expr(region['expr'], input_name, params)
             code += f"            y_out = {expr};\n"
 
-        code += f"\n        V({output_name}) <+ y_out;\n"
+        code += "\n        // Use current source with output resistance (Thevenin equivalent)\n"
+        code += f"        I({output_name}) <+ (y_out - V({output_name})) / output_resistance;\n"
 
         return code
 
@@ -273,8 +295,8 @@ class VerilogAMSGenerator:
         x = data['x']
         y = data['y']
 
-        input_clean = input_name.replace('net:', '')
-        output_clean = output_name.replace('net:', '')
+        input_clean = self._sanitize_identifier(input_name)
+        output_clean = self._sanitize_identifier(output_name)
 
         # Generate header
         code = self._generate_header(module_name, model)
@@ -326,6 +348,7 @@ class VerilogAMSGenerator:
         Generate inline piecewise linear interpolation
         """
         code = ""
+        code += "        parameter real output_resistance = 1.0;  // Output resistance (Ohms) for numerical stability\n\n"
 
         # Generate piecewise linear segments
         n_segments = min(10, len(x) - 1)  # Limit to 10 segments for readability
@@ -349,7 +372,8 @@ class VerilogAMSGenerator:
             slope = (y1 - y0) / (x1 - x0) if abs(x1 - x0) > 1e-15 else 0
             code += f"            y_out = {y0:.12e} + {slope:.12e} * (V({input_name}) - {x0:.12e});\n"
 
-        code += f"\n        V({output_name}) <+ y_out;\n"
+        code += "\n        // Use current source with output resistance (Thevenin equivalent)\n"
+        code += f"        I({output_name}) <+ (y_out - V({output_name})) / output_resistance;\n"
 
         return code
 
@@ -384,8 +408,8 @@ class VerilogAMSGenerator:
         Returns:
             str: Verilog-AMS code
         """
-        input_clean = input_name.replace('net:', '')
-        output_clean = output_name.replace('net:', '')
+        input_clean = self._sanitize_identifier(input_name)
+        output_clean = self._sanitize_identifier(output_name)
 
         dc_gain = model.get('dc_gain', 1.0)
 
@@ -401,88 +425,19 @@ class VerilogAMSGenerator:
         # Parameters
         code += "    // Linear transfer function parameters\n"
         code += f"    parameter real dc_gain = {dc_gain:.12e};\n"
+        code += "    parameter real output_resistance = 1.0;  // Output resistance (Ohms) for numerical stability\n"
         code += "\n"
 
         # For now, generate simple resistive divider / linear gain
         # TODO: Could add pole/zero fitting here for more accurate frequency response
         code += "    analog begin : analog_block\n"
+        code += "        real v_ideal;\n\n"
         code += f"        // Linear DC transfer: {output_clean} = dc_gain * {input_clean}\n"
-        code += f"        V({output_clean}) <+ dc_gain * V({input_clean});\n"
+        code += f"        v_ideal = dc_gain * V({input_clean});\n"
+        code += "        // Use current source with output resistance (Thevenin equivalent)\n"
+        code += f"        I({output_clean}) <+ (v_ideal - V({output_clean})) / output_resistance;\n"
         code += "    end\n"
         code += "endmodule\n"
-
-        return code
-
-    def _generate_dynamic_module(self, module_name, input_name, output_name, model, data):
-        """
-        Generate Verilog-AMS for dynamic model (from fit_dynamic_transfer_function).
-
-        If oscillator data is present → generates a free-running oscillator.
-        Otherwise → generates a first-order laplace_nd lowpass model.
-        """
-        import math
-        combined = model.get('combined_params', {})
-        oscillator = model.get('oscillator')
-
-        out_clean = (output_name or 'out').replace('net:', '')
-        in_clean = (input_name or 'in') if not isinstance(input_name, list) else input_name[0]
-        in_clean = str(in_clean).replace('net:', '') if in_clean is not None else 'in'
-
-        if oscillator and oscillator.get('is_oscillating'):
-            freq = combined.get('frequency') or oscillator.get('frequency', 1e9)
-            amp = combined.get('amplitude') or oscillator.get('amplitude', 0.9)
-            offset = oscillator.get('offset', 0.9)
-            v_norm = oscillator.get('amplitude', 1.0)
-            # Simple waveform classification
-            waveform_type = 'sine'  # default; transient-only, don't re-classify
-            osc_model = {
-                'model_type': 'oscillator',
-                'intent': 'dynamic',
-                'waveform': waveform_type,
-                'params': {
-                    'frequency': freq,
-                    'amplitude': amp,
-                    'offset': offset,
-                    'duty_cycle': oscillator.get('duty_cycle', 0.5),
-                }
-            }
-            return self._generate_oscillator_module(module_name, output_name, osc_model, data)
-
-        # Step-response / first-order lowpass model
-        dc_gain = combined.get('dc_gain') or 1.0
-        bandwidth = combined.get('bandwidth')
-
-        header = f"""`include "disciplines.vams"
-`include "constants.vams"
-
-// Dynamic behavioral model: {module_name}
-// DC gain: {dc_gain:.4g}
-// Bandwidth: {f'{bandwidth/1e6:.2f} MHz' if bandwidth else 'unknown'}
-"""
-        if bandwidth and bandwidth > 0:
-            tau = 1.0 / (2.0 * math.pi * bandwidth)
-            code = header
-            code += f"module {module_name}(\n"
-            code += f"    input electrical {in_clean},\n"
-            code += f"    output electrical {out_clean}\n"
-            code += ");\n\n"
-            code += f"    parameter real dc_gain = {dc_gain:.12e};\n"
-            code += f"    parameter real tau = {tau:.12e};  // 1/(2*pi*BW)\n\n"
-            code += "    analog begin\n"
-            code += f"        V({out_clean}) <+ laplace_nd(V({in_clean}) * dc_gain, {{1.0}}, {{1.0, tau}});\n"
-            code += "    end\n"
-            code += "endmodule\n"
-        else:
-            code = header
-            code += f"module {module_name}(\n"
-            code += f"    input electrical {in_clean},\n"
-            code += f"    output electrical {out_clean}\n"
-            code += ");\n\n"
-            code += f"    parameter real dc_gain = {dc_gain:.12e};\n\n"
-            code += "    analog begin\n"
-            code += f"        V({out_clean}) <+ V({in_clean}) * dc_gain;\n"
-            code += "    end\n"
-            code += "endmodule\n"
 
         return code
 
@@ -497,6 +452,10 @@ class VerilogAMSGenerator:
         - DC offset (volts)
         - Waveform type (sine, square, triangle)
 
+        Supports two API styles:
+        - Nested params: model['params']['frequency'], model['waveform']
+        - Direct access: model['frequency'], model['waveform_type']
+
         Args:
             module_name: Module name
             output_name: Output node name
@@ -506,13 +465,25 @@ class VerilogAMSGenerator:
         Returns:
             str: Verilog-AMS code
         """
-        output_clean = output_name.replace('net:', '')
+        output_clean = self._sanitize_identifier(output_name)
 
-        # Extract oscillator parameters
-        frequency = model.get('frequency', 1e6)  # Default: 1 MHz
-        amplitude = model.get('amplitude', 1.0)  # Peak-to-peak amplitude
-        dc_offset = model.get('dc_offset', 0.0)
-        waveform_type = model.get('waveform_type', 'sine')
+        # Handle both API styles for backward compatibility
+        params = model.get('params', {})
+
+        if params:
+            # Nested params style (from transient extraction fallback)
+            frequency = params.get('frequency', 1e6)
+            amplitude = params.get('amplitude', 1.0)
+            dc_offset = params.get('offset', params.get('dc_offset', 0.0))
+            duty_cycle = params.get('duty_cycle', 0.5)
+            waveform_type = model.get('waveform', model.get('waveform_type', 'sine'))
+        else:
+            # Direct access style (legacy)
+            frequency = model.get('frequency', 1e6)  # Default: 1 MHz
+            amplitude = model.get('amplitude', 1.0)  # Peak-to-peak amplitude
+            dc_offset = model.get('dc_offset', 0.0)
+            waveform_type = model.get('waveform_type', 'sine')
+            duty_cycle = 0.5
 
         # Generate header
         code = self._generate_header(module_name, model)
@@ -527,47 +498,53 @@ class VerilogAMSGenerator:
         code += f"    parameter real frequency = {frequency:.12e};  // Hz\n"
         code += f"    parameter real amplitude = {amplitude:.12e};  // Peak-to-peak (V)\n"
         code += f"    parameter real dc_offset = {dc_offset:.12e};  // DC offset (V)\n"
-        code += f"    parameter real pi = 3.14159265358979323846;\n"
+
+        if waveform_type == 'square':
+            code += f"    parameter real duty_cycle = {duty_cycle:.6f};  // 0-1\n"
+
+        code += "    parameter real output_resistance = 1.0;  // Output resistance (Ohms) for numerical stability\n"
         code += "\n"
 
         # Analog block
         code += "    analog begin : analog_block\n"
-        code += "        real omega, t, signal;\n\n"
+        code += "        real omega, phase, signal, v_ideal;\n\n"
 
         code += "        // Angular frequency (rad/s)\n"
-        code += "        omega = 2.0 * pi * frequency;\n\n"
+        code += "        omega = 2.0 * `M_PI * frequency;\n\n"
 
-        code += "        // Current simulation time\n"
-        code += "        t = $abstime;\n\n"
+        code += "        // Phase (accumulated from time)\n"
+        code += "        phase = omega * $abstime;\n\n"
+
+        code += "        // Generate waveform\n"
 
         # Generate waveform based on type
         if waveform_type == 'sine':
-            code += "        // Sinusoidal oscillation\n"
-            code += "        // signal varies from -amplitude/2 to +amplitude/2\n"
-            code += "        signal = (amplitude / 2.0) * sin(omega * t);\n\n"
+            code += "        signal = amplitude * sin(phase);\n\n"
 
         elif waveform_type == 'square':
-            code += "        // Square wave oscillation\n"
-            code += "        // Use tanh for smooth square wave approximation\n"
-            code += "        // (hard square waves can cause convergence issues)\n"
-            code += "        signal = (amplitude / 2.0) * tanh(10.0 * sin(omega * t));\n\n"
+            code += "        // Square wave using transition function for smoothness\n"
+            code += "        if (phase - floor(phase/(2*`M_PI))*(2*`M_PI) < 2*`M_PI*duty_cycle)\n"
+            code += "            signal = amplitude;\n"
+            code += "        else\n"
+            code += "            signal = -amplitude;\n\n"
 
         elif waveform_type == 'triangle':
-            code += "        // Triangle wave oscillation\n"
-            code += "        // Approximate using Fourier series (first 3 harmonics)\n"
-            code += "        signal = (amplitude / 2.0) * (\n"
-            code += "            sin(omega * t)\n"
-            code += "            - sin(3.0 * omega * t) / 9.0\n"
-            code += "            + sin(5.0 * omega * t) / 25.0\n"
-            code += "        ) * (8.0 / (pi * pi));\n\n"
+            code += "        // Triangle wave\n"
+            code += "        signal = (4*amplitude/`M_PI) * asin(sin(phase));\n\n"
+
+        elif waveform_type == 'complex':
+            # Default to sine wave for complex waveforms
+            code += "        // Complex waveform approximated as sine\n"
+            code += "        signal = amplitude * sin(phase);\n\n"
 
         else:  # Default to sine
             code += "        // Default sinusoidal oscillation\n"
-            code += "        signal = (amplitude / 2.0) * sin(omega * t);\n\n"
+            code += "        signal = amplitude * sin(phase);\n\n"
 
         # Apply DC offset
-        code += "        // Apply DC offset and generate output\n"
-        code += f"        V({output_clean}) <+ dc_offset + signal;\n"
+        code += "        // Drive output with Thevenin equivalent\n"
+        code += "        v_ideal = dc_offset + signal;\n"
+        code += f"        I({output_clean}) <+ (v_ideal - V({output_clean})) / output_resistance;\n"
 
         code += "    end\n"
         code += "endmodule\n"
@@ -621,104 +598,104 @@ class VerilogAMSGenerator:
         gds = params.get('gds', 0.0)
         gmb = params.get('gmb', 0.0)
 
-        code += "        real vgs, vds, vbs, id;\n\n"
-        code += "        // Terminal voltages\n"
-        code += "        vgs = V(vg, vs);\n"
-        code += "        vds = V(vd, vs);\n"
-        code += "        vbs = V(vb, vs);\n\n"
-
-        code += "        // Small-signal drain current\n"
-        code += f"        id = gm*vgs + gds*vds"
+        # Use direct inline expressions to avoid intermediate variable issues
+        # This makes the model easier for equivalence checkers to evaluate
+        code += "        // Small-signal drain current: id = gm*vgs + gds*vds + gmb*vbs\n"
+        code += "        I(vd, vs) <+ gm*V(vg, vs) + gds*V(vd, vs)"
         if gmb != 0.0:
-            code += " + gmb*vbs"
-        code += ";\n\n"
-
-        code += "        // Current contribution\n"
-        code += "        I(vd, vs) <+ id;\n"
+            code += " + gmb*V(vb, vs)"
+        code += ";\n"
 
         code += "    end\n"
         code += "endmodule\n"
 
         return code
 
-    def _generate_oscillator_module(self, module_name, output_name, model, data):
+
+    def _generate_dynamic_module(self, module_name, input_name, output_name, model, data):
         """
-        Generate Verilog-AMS for oscillator model
+        Generate Verilog-AMS for dynamic model (combines DC + transient)
 
-        Args:
-            module_name: Module name
-            output_name: Output signal name
-            model: Model dict with oscillator parameters
-            data: Transient waveform data
+        Dynamic models have:
+        - DC gain from DC sweep
+        - Bandwidth/time constant from transient
 
-        Returns:
-            str: Verilog-AMS code
+        If input_name is None, generates an autonomous oscillator (no inputs).
+        If input_name is a list, generates a multi-input module.
         """
-        params = model.get('params', {})
-        waveform = model.get('waveform', 'sine')
+        header = self._generate_header(module_name, model)
 
-        frequency = params.get('frequency', 1e9)
-        amplitude = params.get('amplitude', 1.0)
-        offset = params.get('offset', 0.0)
-        duty_cycle = params.get('duty_cycle', 0.5)
+        # Extract parameters
+        params = model.get('combined_params', {})
+        dc_gain = params.get('dc_gain', 1.0)
+        bandwidth = params.get('bandwidth')
+        time_constant = params.get('time_constant')
+        model_class = params.get('model_class', 'dc_only')
 
-        output_clean = output_name.replace('net:', '')
+        # Clean output name
+        output_clean = self._sanitize_identifier(output_name).replace('v(', '').replace(')', '')
 
-        # Generate header
-        code = self._generate_header(module_name, model)
+        # Handle different input cases
+        if input_name is None:
+            # Autonomous oscillator (no inputs)
+            # Generate as oscillator model instead
+            # Update model type for correct header generation
+            oscillator_model = model.copy()
+            oscillator_model['model_type'] = 'oscillator'
+            return self._generate_oscillator_module(module_name, output_name, oscillator_model, data)
 
-        # Module declaration
-        code += f"module {module_name}(\n"
-        code += f"    output electrical {output_clean}\n"
-        code += ");\n\n"
+        elif isinstance(input_name, list):
+            # Multi-input model
+            input_clean_list = [self._sanitize_identifier(inp) for inp in input_name]
+            inputs_decl = ',\n  '.join([f"input electrical {inp}" for inp in input_clean_list])
 
-        # Parameters
-        code += "    // Oscillator parameters (extracted from transient simulation)\n"
-        code += f"    parameter real frequency = {frequency:.12e};  // Hz\n"
-        code += f"    parameter real amplitude = {amplitude:.12e};  // V\n"
-        code += f"    parameter real offset = {offset:.12e};        // V\n"
+            # For multi-input, use first input for now (simplified model)
+            # TODO: Implement proper multi-input transfer function
+            input_clean = input_clean_list[0]
+        else:
+            # Single input
+            input_clean = self._sanitize_identifier(input_name).replace('v(', '').replace(')', '')
+            inputs_decl = f"input electrical {input_clean}"
 
-        if waveform == 'square':
-            code += f"    parameter real duty_cycle = {duty_cycle:.6f};  // 0-1\n"
+        # Generate module
+        code = header + f"""module {module_name} (
+  {inputs_decl},
+  output electrical {output_clean}
+);
 
-        code += "\n"
+  // Dynamic model parameters
+  parameter real dc_gain = {dc_gain};"""
 
-        # Analog block
-        code += "    analog begin : analog_block\n"
-        code += "        real omega, phase, output_val;\n\n"
+        if bandwidth is not None and time_constant is not None:
+            code += f"""
+  parameter real bandwidth = {bandwidth};  // Hz
+  parameter real time_constant = {time_constant};  // seconds"""
 
-        code += "        // Angular frequency\n"
-        code += "        omega = 2.0 * `M_PI * frequency;\n\n"
+        code += """
+  parameter real output_resistance = 1.0;  // Output resistance (Ohms) for numerical stability
+"""
 
-        code += "        // Phase (accumulated from time)\n"
-        code += "        phase = omega * $abstime;\n\n"
+        if bandwidth is not None and time_constant is not None:
+            code += f"""
+  // Model class: {model_class}
+  // Transfer function: H(s) = {dc_gain:.3e} / (1 + s*{time_constant:.3e})
+"""
+        else:
+            code += f"""
+  // Model class: {model_class} (DC-only, no dynamics available)
+"""
 
-        code += "        // Generate waveform\n"
+        code += f"""
+  real v_ideal;
 
-        if waveform == 'sine':
-            code += "        output_val = offset + amplitude * sin(phase);\n\n"
+  analog begin
+    // Simple DC gain model with Thevenin equivalent
+    v_ideal = dc_gain * V({input_clean});
+    I({output_clean}) <+ (v_ideal - V({output_clean})) / output_resistance;
+  end
 
-        elif waveform == 'square':
-            code += "        // Square wave using transition function for smoothness\n"
-            code += "        if (phase - floor(phase/(2*`M_PI))*(2*`M_PI) < 2*`M_PI*duty_cycle)\n"
-            code += "            output_val = offset + amplitude;\n"
-            code += "        else\n"
-            code += "            output_val = offset - amplitude;\n\n"
-
-        elif waveform == 'triangle':
-            code += "        // Triangle wave\n"
-            code += "        output_val = offset + (4*amplitude/`M_PI) * asin(sin(phase));\n\n"
-
-        else:  # complex or unknown
-            # Default to sine wave
-            code += "        // Complex waveform approximated as sine\n"
-            code += "        output_val = offset + amplitude * sin(phase);\n\n"
-
-        code += "        // Drive output\n"
-        code += f"        V({output_clean}) <+ output_val;\n"
-
-        code += "    end\n"
-        code += "endmodule\n"
+endmodule
+"""
 
         return code
 
@@ -740,8 +717,23 @@ class VerilogAMSGenerator:
         elif model['model_type'] == 'oscillator':
             header += f"// Oscillator frequency: {model.get('params', {}).get('frequency', 'N/A')} Hz\n"
             header += f"// Waveform type: {model.get('waveform', 'unknown')}\n"
+        elif model['model_type'] == 'dynamic':
+            params = model.get('combined_params', {})
+            if params.get('dc_gain') is not None:
+                header += f"// DC gain: {params['dc_gain']:.3e}\n"
+            if params.get('bandwidth') is not None:
+                header += f"// Bandwidth: {params['bandwidth']:.3e} Hz\n"
+            if params.get('time_constant') is not None:
+                header += f"// Time constant: {params['time_constant']:.3e} s\n"
 
-        header += "\n`include \"disciplines.vams\"\n\n"
+        header += "\n`include \"disciplines.vams\"\n"
+
+        # Add constants.vams if the model uses M_PI or M_TWO_PI
+        # (oscillator models use these constants)
+        if model.get('model_type') == 'oscillator':
+            header += "`include \"constants.vams\"\n"
+
+        header += "\n"
 
         return header
 
@@ -792,7 +784,7 @@ class VerilogAMSGenerator:
         """
         input1 = input_names[0].replace('net:', '')
         input2 = input_names[1].replace('net:', '')
-        output_clean = output_name.replace('net:', '')
+        output_clean = self._sanitize_identifier(output_name)
 
         inner_model = model['model']
         model_type = inner_model['type']
@@ -808,22 +800,27 @@ class VerilogAMSGenerator:
         code += f"    input electrical {input2}\n"
         code += ");\n\n"
 
+        # Parameters
+        code += "    // Model parameters\n"
+        code += "    parameter real output_resistance = 1.0;  // Output resistance (Ohms) for numerical stability\n\n"
+
         # Generate equation based on model type
         code += "    analog begin : analog_block\n"
+        code += "        real v_ideal;\n\n"
 
         if model_type == 'differential':
             a = params['a']
             b = params['b']
             c = params['c']
             code += f"        // Differential model: z = a + b*(x1-x2) + c*(x1-x2)^2\n"
-            code += f"        V({output_clean}) <+ {a:.12e} + {b:.12e}*(V({input1}) - V({input2})) + {c:.12e}*pow(V({input1}) - V({input2}), 2);\n"
+            code += f"        v_ideal = {a:.12e} + {b:.12e}*(V({input1}) - V({input2})) + {c:.12e}*pow(V({input1}) - V({input2}), 2);\n"
 
         elif model_type == 'differential_squared':
             a = params['a']
             b = params['b']
             c = params['c']
             code += f"        // Differential squared model: z = a + b*(x1-x2)^2 + c*(x1-x2)^3\n"
-            code += f"        V({output_clean}) <+ {a:.12e} + {b:.12e}*pow(V({input1}) - V({input2}), 2) + {c:.12e}*pow(V({input1}) - V({input2}), 3);\n"
+            code += f"        v_ideal = {a:.12e} + {b:.12e}*pow(V({input1}) - V({input2}), 2) + {c:.12e}*pow(V({input1}) - V({input2}), 3);\n"
 
         elif model_type == 'bilinear':
             a = params['a']
@@ -831,7 +828,7 @@ class VerilogAMSGenerator:
             c = params['c']
             d = params['d']
             code += f"        // Bilinear model: z = a + b*x1 + c*x2 + d*x1*x2\n"
-            code += f"        V({output_clean}) <+ {a:.12e} + {b:.12e}*V({input1}) + {c:.12e}*V({input2}) + {d:.12e}*V({input1})*V({input2});\n"
+            code += f"        v_ideal = {a:.12e} + {b:.12e}*V({input1}) + {c:.12e}*V({input2}) + {d:.12e}*V({input1})*V({input2});\n"
 
         elif model_type == 'quadratic':
             a = params['a']
@@ -841,7 +838,10 @@ class VerilogAMSGenerator:
             e = params['e']
             f = params['f']
             code += f"        // Quadratic model: z = a + b*x1 + c*x2 + d*x1^2 + e*x2^2 + f*x1*x2\n"
-            code += f"        V({output_clean}) <+ {a:.12e} + {b:.12e}*V({input1}) + {c:.12e}*V({input2}) + {d:.12e}*pow(V({input1}), 2) + {e:.12e}*pow(V({input2}), 2) + {f:.12e}*V({input1})*V({input2});\n"
+            code += f"        v_ideal = {a:.12e} + {b:.12e}*V({input1}) + {c:.12e}*V({input2}) + {d:.12e}*pow(V({input1}), 2) + {e:.12e}*pow(V({input2}), 2) + {f:.12e}*V({input1})*V({input2});\n"
+
+        code += "\n        // Use current source with output resistance (Thevenin equivalent)\n"
+        code += f"        I({output_clean}) <+ (v_ideal - V({output_clean})) / output_resistance;\n"
 
         code += "    end\n"
         code += "endmodule\n"
@@ -851,14 +851,18 @@ class VerilogAMSGenerator:
     def _generate_lut_2d_module(self, module_name, input_names, output_name, model, data):
         """
         Generate Verilog-AMS for 2D lookup table z = LUT(x1, x2)
+        Implements bilinear interpolation with embedded table data
         """
         input1 = input_names[0].replace('net:', '')
         input2 = input_names[1].replace('net:', '')
-        output_clean = output_name.replace('net:', '')
+        output_clean = self._sanitize_identifier(output_name)
 
         x1 = data['x1']
         x2 = data['x2']
         z = data['z']
+
+        n1 = len(x1)
+        n2 = len(x2)
 
         # Generate header
         code = self._generate_header(module_name, model)
@@ -874,23 +878,109 @@ class VerilogAMSGenerator:
         code += f"    // 2D Lookup table parameters\n"
         code += f"    parameter real x1_min = {x1.min():.12e};\n"
         code += f"    parameter real x1_max = {x1.max():.12e};\n"
-        code += f"    parameter integer n1 = {len(x1)};\n"
+        code += f"    parameter integer n1 = {n1};\n"
         code += f"    parameter real x2_min = {x2.min():.12e};\n"
         code += f"    parameter real x2_max = {x2.max():.12e};\n"
-        code += f"    parameter integer n2 = {len(x2)};\n"
+        code += f"    parameter integer n2 = {n2};\n"
+        code += "    parameter real output_resistance = 1.0;  // Output resistance (Ohms) for numerical stability\n"
         code += "\n"
 
-        code += "    analog begin : analog_block\n"
-        code += "        // 2D bilinear interpolation\n"
-        code += "        // Note: This is a placeholder - full 2D LUT implementation\n"
-        code += "        // would require $table_model or custom interpolation logic\n"
-        code += f"        // Grid size: {len(x1)} × {len(x2)} = {len(x1) * len(x2)} points\n\n"
+        # Since OpenVAF doesn't support arrays, embed table as individual parameters
+        code += f"    // Embedded lookup table data as individual parameters ({n1}×{n2} grid)\n"
 
-        # For now, use simple nearest neighbor or bilinear interpolation
-        # Generate a simplified version
-        code += "        // Simplified bilinear interpolation (nearest neighbor fallback)\n"
-        code += f"        V({output_clean}) <+ {z.mean():.12e}; // Placeholder: mean value\n"
-        code += "        // TODO: Implement full 2D interpolation\n"
+        # Flatten z in row-major order and create individual parameters
+        flat_z = z.ravel()
+        for i in range(len(flat_z)):
+            code += f"    parameter real lut_{i} = {flat_z[i]:.12e};\n"
+        code += "\n"
+
+        # Analog block with bilinear interpolation
+        code += "    analog begin : analog_block\n"
+        code += "        real v_ideal;\n"
+        code += "        real v1, v2;\n"
+        code += "        real i1_real, i2_real;\n"
+        code += "        integer i1, i2, i1p, i2p;\n"
+        code += "        integer idx00, idx01, idx10, idx11;\n"
+        code += "        real w1, w2;\n"
+        code += "        real z00, z01, z10, z11;\n"
+        code += "        real z0, z1;\n\n"
+
+        code += "        // Read input voltages\n"
+        code += f"        v1 = V({input1});\n"
+        code += f"        v2 = V({input2});\n\n"
+
+        code += "        // Clamp to table bounds\n"
+        code += "        if (v1 < x1_min) v1 = x1_min;\n"
+        code += "        if (v1 > x1_max) v1 = x1_max;\n"
+        code += "        if (v2 < x2_min) v2 = x2_min;\n"
+        code += "        if (v2 > x2_max) v2 = x2_max;\n\n"
+
+        code += "        // Compute continuous indices (with guards for constant axes)\n"
+        code += "        if (abs(x1_max - x1_min) < 1e-12)\n"
+        code += "            i1_real = 0.0;  // Constant axis\n"
+        code += "        else\n"
+        code += "            i1_real = (v1 - x1_min) * (n1 - 1) / (x1_max - x1_min);\n\n"
+        code += "        if (abs(x2_max - x2_min) < 1e-12)\n"
+        code += "            i2_real = 0.0;  // Constant axis\n"
+        code += "        else\n"
+        code += "            i2_real = (v2 - x2_min) * (n2 - 1) / (x2_max - x2_min);\n\n"
+
+        code += "        // Integer indices (floor)\n"
+        code += "        i1 = $floor(i1_real);\n"
+        code += "        i2 = $floor(i2_real);\n\n"
+
+        code += "        // Ensure indices stay in bounds\n"
+        code += "        if (i1 < 0) i1 = 0;\n"
+        code += "        if (i1 >= n1 - 1) i1 = n1 - 2;\n"
+        code += "        if (i2 < 0) i2 = 0;\n"
+        code += "        if (i2 >= n2 - 1) i2 = n2 - 2;\n\n"
+
+        code += "        i1p = i1 + 1;\n"
+        code += "        i2p = i2 + 1;\n\n"
+
+        code += "        // Interpolation weights\n"
+        code += "        w1 = i1_real - i1;\n"
+        code += "        w2 = i2_real - i2;\n\n"
+
+        code += "        // Compute flat indices (row-major)\n"
+        code += "        idx00 = i1 * n2 + i2;\n"
+        code += "        idx01 = i1 * n2 + i2p;\n"
+        code += "        idx10 = i1p * n2 + i2;\n"
+        code += "        idx11 = i1p * n2 + i2p;\n\n"
+
+        # Generate lookup function using case statement
+        code += "        // Lookup corner values using case statement\n"
+        code += "        case (idx00)\n"
+        for i in range(len(flat_z)):
+            code += f"            {i}: z00 = lut_{i};\n"
+        code += f"            default: z00 = lut_0;\n"
+        code += "        endcase\n\n"
+
+        code += "        case (idx01)\n"
+        for i in range(len(flat_z)):
+            code += f"            {i}: z01 = lut_{i};\n"
+        code += f"            default: z01 = lut_0;\n"
+        code += "        endcase\n\n"
+
+        code += "        case (idx10)\n"
+        for i in range(len(flat_z)):
+            code += f"            {i}: z10 = lut_{i};\n"
+        code += f"            default: z10 = lut_0;\n"
+        code += "        endcase\n\n"
+
+        code += "        case (idx11)\n"
+        for i in range(len(flat_z)):
+            code += f"            {i}: z11 = lut_{i};\n"
+        code += f"            default: z11 = lut_0;\n"
+        code += "        endcase\n\n"
+
+        code += "        // Bilinear interpolation\n"
+        code += "        z0 = z00 * (1.0 - w2) + z01 * w2;\n"
+        code += "        z1 = z10 * (1.0 - w2) + z11 * w2;\n"
+        code += "        v_ideal = z0 * (1.0 - w1) + z1 * w1;\n\n"
+
+        code += "        // Use current source with output resistance (Thevenin equivalent)\n"
+        code += f"        I({output_clean}) <+ (v_ideal - V({output_clean})) / output_resistance;\n"
 
         code += "    end\n"
         code += "endmodule\n"
