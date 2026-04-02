@@ -1232,3 +1232,404 @@ result = run_for_client(
 The boundary is clear: we provide the golden reference and the comparison script;
 the engineer provides the EDA simulation. They bring the result back and we compute
 the final system-level verdict.
+
+---
+
+## Appendix A — Mixed-Signal IP Examples: Analog Block → Digital Block Interfaces
+
+These are real open-source examples and derived test cases where a SPICE netlist
+(analog block) feeds its output directly into a digital Verilog/SV block, or vice
+versa. All interface types and port names are drawn from actual repositories.
+
+Sources used:
+- [lakshmi-sathi/avsdpll_1v8](https://github.com/lakshmi-sathi/avsdpll_1v8) — SKY130 transistor-level PLL
+- [manili/VSDBabySoC](https://github.com/manili/VSDBabySoC) — open-source mixed-signal SoC
+- [SparcLab/OpenSERDES](https://github.com/SparcLab/OpenSERDES) — 2 Gbps SerDes in SKY130
+- [L28E/MRCP-CDR](https://github.com/L28E/MRCP-CDR) — bang-bang CDR with Verilog-A phase rotator
+- [designers-guide.org VCO models](https://designers-guide.org/verilog-ams/functional-blocks/vco/vco.va)
+- Verilog-AMS LRM §10 (connect modules), BMAS 2000 Frey paper
+
+---
+
+### Interface Pattern Taxonomy
+
+| # | Analog block | Digital block | Interface signal | Level shift needed? |
+|---|-------------|--------------|-----------------|-------------------|
+| 1 | Ring VCO (SPICE) | DFF frequency divider (Verilog) | Single-ended CMOS clock | None — same VDD rail |
+| 2 | Charge pump (SPICE) | Phase-frequency detector (Verilog gates) | `up`/`down` logic levels drive FET gates | None — CMOS logic drives FET gate directly |
+| 3 | 10-bit R-2R DAC (SPICE) | RISC-V core register output (Verilog) | 10-bit digital bus → analog voltage | Implicit via Verilog `real` type |
+| 4 | CML differential pair (SPICE) | CMOS DFF sampler (Verilog) | Differential 400 mV CML swing | Yes — `connectmodule a2d` with threshold at CML Vcm |
+| 5 | Resistive-feedback TIA/sense amp (SPICE) | Oversampling CDR logic (Verilog) | Rail-to-rail CMOS after gain restoration | None — inverter restores rails |
+| 6 | PLL behavioral model (Verilog-A) | RISC-V `clk` input (Verilog) | Multiplied clock (8x), single-ended 1.8V | None |
+
+---
+
+### Test Case 1 — VCO → Frequency Divider (avsdpll_1v8)
+
+**What it is:** The core analog-to-digital crossing inside a PLL. The ring VCO
+output (analog oscillation) drives a chain of D flip-flop dividers (purely digital).
+This is universally present in any PLL or clock-generation circuit.
+
+**SPICE analog block (`VCO.cir` from avsdpll_1v8):**
+```spice
+* Current-starved 3-stage ring oscillator, SKY130 1.8V
+.subckt vco  in  out  VDD  GND
+* in  = Vctrl (control voltage input, ~0.4–1.6 V)
+* out = Clk_Out (clock output, rail-to-rail CMOS, 40–100 MHz)
+* Transistors: sky130_fd_pr__nfet_01v8, sky130_fd_pr__pfet_01v8
+* Ibias stages control oscillation frequency via Vctrl on gate
+.ends
+```
+
+**Target Verilog-AMS behavioral model (SynapticAMS output):**
+```verilog
+`include "disciplines.vams"
+`include "constants.vams"
+module RingVCO (out, ctrl);
+  output electrical out;
+  input  electrical ctrl;
+  parameter real fmin      = 40e6;    // Hz @ Vctrl_min
+  parameter real fmax      = 100e6;   // Hz @ Vctrl_max
+  parameter real vctrl_min = 0.4;     // V
+  parameter real vctrl_max = 1.6;     // V
+  parameter real vamp      = 0.9;     // output amplitude
+  parameter real vbias     = 0.9;     // output DC bias
+  real freq;
+  analog begin
+    freq = (V(ctrl) - vctrl_min) * (fmax - fmin) / (vctrl_max - vctrl_min) + fmin;
+    freq = max(fmin, min(fmax, freq));
+    V(out) <+ vbias + vamp * sin(2 * `M_PI * idtmod(freq, 0.0, 1.0, 0.0));
+  end
+endmodule
+```
+
+**Digital block that consumes it (`FD.v`, divider /2):**
+```verilog
+module FreqDiv (input wire clk, output reg clk_out);
+  always @(posedge clk)
+    clk_out <= ~clk_out;
+endmodule
+```
+
+**Interface crossing:** `out` (electrical/EENet) → `clk` (logic).
+Requires `connectmodule a2d` with `vth = 0.9` (VDD/2 = 1.8/2).
+No external level-shifter needed since VCO output is already rail-to-rail CMOS.
+
+**Why this is a good test case:**
+The VCO behavioral model uses `idtmod` (time-domain integration) — a dynamic model
+that Python NRMSE cannot evaluate (see P5.6b). Validation requires Bode NRMSE on
+the VCO's Kvco characteristic (linear fit of fout vs Vctrl), plus a transient check
+in Layer 4 (EDA testbench).
+
+---
+
+### Test Case 2 — Charge Pump (Digital UP/DOWN → Analog Current)
+
+**What it is:** The digital Phase-Frequency Detector (PFD) outputs two logic pulses
+(`up`, `down`). These drive the gate nodes of current-mirror transistors in the
+Charge Pump, which either sources or sinks current into the loop filter. Classic
+digital-output → analog-input crossing.
+
+**SPICE analog block (`CP.cir` from avsdpll_1v8):**
+```spice
+.subckt cp  up  down  out  VDD  GND
+* up, down: logic-level inputs from PFD (0 or 1.8V CMOS)
+* out: analog current output into loop filter node (VCtrl)
+* Key transistors:
+*   xm44: sky130_fd_pr__pfet_01v8 w=420n l=150n  (sources Icp when up=1)
+*   xm31: sky130_fd_pr__nfet_01v8 w=420n l=150n  (sinks Icp when down=1)
+*   xm43/xm32: bias mirror w=5.4u
+.ends
+```
+
+**Target Verilog-AMS behavioral model (SynapticAMS output):**
+```verilog
+`include "disciplines.vams"
+module ChargePump (out, up, down);
+  output electrical out;
+  input  logic up;     // from PFD — digital
+  input  logic down;   // from PFD — digital
+  parameter real Icp = 10e-6;  // A — pump current (extracted from SPICE DC sweep)
+  analog begin
+    if (up === 1'b1)
+      I(out) <+ Icp;
+    else if (down === 1'b1)
+      I(out) <+ -Icp;
+    else
+      I(out) <+ 0.0;
+  end
+endmodule
+```
+
+**Digital block that drives it (`PFD.v`):**
+```verilog
+module PFD (
+  input  wire ref_clk,
+  input  wire div_clk,
+  output reg  up,
+  output reg  down
+);
+  // Standard phase-frequency detector using SR latch + reset path
+  always @(posedge ref_clk) up   <= 1'b1;
+  always @(posedge div_clk) down <= 1'b1;
+  always @(posedge up or posedge down)
+    if (up & down) begin up <= 0; down <= 0; end
+endmodule
+```
+
+**Interface crossing:** `up`/`down` (logic) → Charge Pump `up`/`down` (drives FET
+gate, effectively analog). Uses `connectmodule d2a` with `voh=1.8`, `vol=0.0`, `tt=100ps`.
+
+**Why this is a good test case:**
+The behavioral model is driven by logic inputs, not `electrical` inputs.
+SynapticAMS currently generates models with `input electrical in` — this case
+requires `input logic up` (mixed-signal port). Tests the digital-input path
+in the behavioral generator that current examples don't cover.
+
+---
+
+### Test Case 3 — 10-bit DAC (Digital Bus → Analog Voltage)
+
+**What it is:** A RISC-V core writes a 10-bit value to a register. That register
+output directly drives a DAC's digital input bus. The DAC converts it to an analog
+output voltage. Present in VSDBabySoC.
+
+**SPICE analog block (R-2R ladder DAC):**
+```spice
+.subckt avsddac  OUT  D9  D8  D7  D6  D5  D4  D3  D2  D1  D0  VREFH  VREFL  VDD  GND
+* D9..D0: 10 individual 1-bit digital inputs (CMOS logic level)
+* OUT: analog output voltage
+* VREFH, VREFL: analog reference supply
+* Implemented as binary-weighted or R-2R resistor ladder
+.ends
+```
+
+**Target Verilog-AMS behavioral model:**
+```verilog
+`include "disciplines.vams"
+module DAC10bit (OUT, D, VREFH, VREFL);
+  output electrical OUT;
+  input  [9:0] D;           // 10-bit digital input bus
+  input  electrical VREFH;
+  input  electrical VREFL;
+  real vout;
+  analog begin
+    vout = V(VREFL) + ($itor($unsigned(D)) / 1023.0) * (V(VREFH) - V(VREFL));
+    V(OUT) <+ vout;
+  end
+endmodule
+```
+
+**Digital block that drives it (RISC-V register output):**
+```verilog
+// In rvmyth.v — the RISC-V core
+output wire [9:0] RV_TO_DAC;  // connected to x17 (a7) register bits [9:0]
+```
+
+**Interface crossing:** `[9:0]` logic bus → individual analog reference voltages.
+Requires a `d2a` connect module per bit, or the bus is treated as `wreal`
+(4-state logic → real voltage) by the simulator.
+
+**Why this is a good test case:**
+Multi-bit bus interface. The SPICE netlist has 10 separate digital input terminals
+(`D9..D0`), which the behavioral generator must handle as a bus. Tests bus-width
+handling in port extraction and in the `connectmodule` generation logic.
+
+---
+
+### Test Case 4 — CML Differential Pair → CMOS CDR (SerDes RX)
+
+**What it is:** The classic SerDes receive path. A CML (Current-Mode Logic) differential
+pair amplifies the incoming data signal from a lossy channel. Its differential output
+(~400 mV swing, offset to VDD - Ibias*Rc/2) must be converted to full-swing CMOS
+before the digital CDR can sample it. This is the interface where level-shifting is
+genuinely required.
+
+**SPICE analog block (CML differential pair RX):**
+```spice
+.subckt cml_rx  inp  inn  outp  outn  vdd  vss  ibias
+* inp, inn:  differential data input (~100 mV swing from channel)
+* outp, outn: differential output (~400 mV swing, Vcm = VDD - Ibias*Rc/2)
+* ibias: tail current bias (~1 mA)
+* Topology: NFET diff pair (M1/M2) + resistive loads Rc + tail current mirror
+M1  outn  inp  tail  vss  nmos  W=20u  L=0.18u
+M2  outp  inn  tail  vss  nmos  W=20u  L=0.18u
+M3  tail  ibias_gate  vss  vss  nmos  W=10u  L=0.5u
+Rc1  vdd  outp  200   * 200 Ω load
+Rc2  vdd  outn  200
+.ends
+```
+
+**Target Verilog-AMS behavioral model (SynapticAMS output):**
+```verilog
+`include "disciplines.vams"
+`include "constants.vams"
+module CML_RX (outp, outn, inp, inn);
+  output electrical outp;
+  output electrical outn;
+  input  electrical inp;
+  input  electrical inn;
+  parameter real voh  = 1.6;      // V — output high (VDD - Ibias*Rc_low/2)
+  parameter real vol  = 1.0;      // V — output low  (VDD - Ibias*Rc_high/2)
+  parameter real gain = 4.0;      // V/V — differential gain
+  parameter real vth  = 0.0;      // V — differential threshold
+  parameter real tau  = 7.96e-10; // s — extracted from AC sweep
+  real vdiff;
+  analog begin
+    vdiff = V(inp) - V(inn);
+    V(outp) <+ min(voh, max(vol, (voh+vol)/2.0 + gain *
+               laplace_nd(vdiff - vth, {1.0}, {1.0, tau})));
+    V(outn) <+ min(voh, max(vol, (voh+vol)/2.0 - gain *
+               laplace_nd(vdiff - vth, {1.0}, {1.0, tau})));
+  end
+endmodule
+```
+
+**CML→CMOS level-shifting adapter (generated by system_assembler):**
+```verilog
+`include "disciplines.vams"
+// Auto-generated adapter: CML_RX outp/outn → single-ended CMOS for DFF input
+module CML_to_CMOS (cmos_out, cml_p, cml_n);
+  output electrical cmos_out;
+  input  electrical cml_p;
+  input  electrical cml_n;
+  parameter real vth_cml = 1.3;  // V — CML common-mode (voh+vol)/2
+  parameter real vol = 0.0;      // V — CMOS output low
+  parameter real voh = 1.8;      // V — CMOS output high
+  parameter real tt  = 20e-12;   // s — transition time
+  real vdiff;
+  analog begin
+    vdiff = V(cml_p) - V(cml_n);
+    V(cmos_out) <+ transition((vdiff > 0.0) ? voh : vol, 0, tt);
+  end
+endmodule
+```
+
+**Digital CDR that consumes CMOS output (`CDR.sv` pattern from OpenSERDES):**
+```systemverilog
+module CDR_oversampling (
+  input  logic data_in,    // from CML→CMOS adapter
+  input  logic clk_3x,     // 3x oversampling clock from VCO
+  output logic data_out,   // recovered data
+  output logic clk_rec     // recovered clock
+);
+  // 3-sample majority vote + bang-bang phase alignment
+endmodule
+```
+
+**Interface crossing in system_top.va:**
+```verilog
+// system_top.va (auto-generated by system_assembler)
+electrical w_cml_outp, w_cml_outn;  // CML domain wires
+electrical w_cmos_data;              // CMOS domain wire
+
+CML_RX   i_rx   (.outp(w_cml_outp), .outn(w_cml_outn),
+                  .inp(channel_p),   .inn(channel_n));
+CML_to_CMOS i_lvl (.cmos_out(w_cmos_data),
+                    .cml_p(w_cml_outp), .cml_n(w_cml_outn));
+// w_cmos_data → CDR.data_in via connectmodule a2d
+CDR_oversampling i_cdr (.data_in(/* w_cmos_data via a2d */), ...);
+```
+
+**Why this is a good test case:**
+Combines the three hardest problems: (1) differential → single-ended conversion,
+(2) CML common-mode level shift (Vcm ≈ 1.3V, not VDD/2 = 0.9V), and (3)
+a `laplace_nd` dynamic model that bypasses the Python evaluator. This is the
+most complete end-to-end test of the system integration pipeline.
+
+---
+
+### Test Case 5 — RC Channel (Passive Analog) + OpenSERDES TX/RX Chain
+
+**What it is:** The full OpenSERDES datapath. TX serializer (digital) → TX driver
+(analog, SPICE) → RC lossy channel (passive analog) → RX sense amp (analog) →
+CDR (digital). Two analog-digital crossings in one signal chain.
+
+**TX crossing: Digital serializer → Analog inverter chain driver:**
+```spice
+* OpenSERDES TX driver (Inverter_Based_Tx)
+.subckt tx_driver  data_in  txp  txn  VDD  GND
+* data_in: CMOS logic level from digital serializer
+* txp, txn: differential output to channel (~800mV single-ended swing)
+* Topology: CMOS inverter chain + PTAT current for 50Ω termination
+.ends
+```
+
+```verilog
+// Digital serializer (synthesized, drives tx_driver)
+module Serializer #(parameter WIDTH=8) (
+  input  wire [WIDTH-1:0] parallel_in,
+  input  wire             clk,
+  output wire             serial_out    // → tx_driver.data_in
+);
+```
+
+**Channel model (passive RC analog):**
+```spice
+.subckt channel  inp  inn  outp  outn
+* First-order RC lowpass, ~34 dB insertion loss at 1 GHz
+* Models PCB trace + connector parasitics
+R1  inp   n1    25     * series resistance
+C1  n1    0     2p     * shunt capacitance
+R2  n1    outp  25
+* (mirror for negative channel)
+.ends
+```
+
+**Target Verilog-AMS for channel (SynapticAMS output, from AC sweep of channel SPICE):**
+```verilog
+`include "disciplines.vams"
+`include "constants.vams"
+module RCChannel (outp, outn, inp, inn);
+  output electrical outp, outn;
+  input  electrical inp,  inn;
+  parameter real gain = 0.5;     // DC insertion loss
+  parameter real tau  = 159e-12; // s → f_3dB = 1/(2π*τ) ≈ 1 GHz
+  real vdiff;
+  analog begin
+    vdiff = V(inp) - V(inn);
+    V(outp) <+ (vdiff / 2.0) * laplace_nd(1.0, {gain}, {1.0, tau});
+    V(outn) <+ -(vdiff / 2.0) * laplace_nd(1.0, {gain}, {1.0, tau});
+  end
+endmodule
+```
+
+**RX crossing: Analog sense amp → Digital CDR:**
+Same as Test Case 4. The OpenSERDES resistive-feedback inverter restores rail-to-rail
+swing; its output connects directly to the CDR DFF clock input.
+
+**Full system signal chain (system_top.va):**
+```verilog
+electrical ser_out;           // Serializer → TX driver
+electrical txp, txn;          // TX driver → channel (differential)
+electrical rxp, rxn;          // channel → RX sense amp
+electrical cmos_data;         // RX sense amp → CDR
+
+Serializer   i_ser  (.serial_out(ser_out), ...);
+TXDriver     i_tx   (.data_in(ser_out), .txp(txp), .txn(txn), ...);
+RCChannel    i_ch   (.inp(txp), .inn(txn), .outp(rxp), .outn(rxn));
+CML_RX       i_rx   (.inp(rxp), .inn(rxn), .outp(w_cmlp), .outn(w_cmln));
+CML_to_CMOS  i_lvl  (.cml_p(w_cmlp), .cml_n(w_cmln), .cmos_out(cmos_data));
+CDR_oversamp i_cdr  (.data_in(/* cmos_data via a2d */), .clk_3x(clk_3x), ...);
+```
+
+**Why this is the ideal demo circuit:**
+It exercises every feature of the pipeline — behavioral generation from SPICE (4 analog
+blocks), dynamic model validation (Bode NRMSE for CML_RX and RCChannel), adapter
+generation (CML→CMOS), connect module insertion (electrical → logic), and multi-block
+system assembly. This should be the primary integration test for P5.5–P5.7.
+
+---
+
+### Implications for `system_assembler.py` and `system_equivalence.py`
+
+These test cases define the concrete capabilities the system integration code needs:
+
+| Capability | Required by | Current state |
+|------------|-------------|---------------|
+| Parse `input logic [9:0] D` bus ports | Test Case 3 (DAC) | Not implemented — regex only handles scalar ports |
+| Generate `connectmodule a2d/d2a` stubs | Test Cases 1,3,4,5 | Not implemented — only `electrical` stubs today |
+| Set `vth` in `a2d` to CML Vcm (not VDD/2) | Test Case 4 (CML) | Not implemented — needs AI to infer Vcm from VA parameters |
+| Multi-output differential block (outp/outn) | Test Cases 4,5 | Partially — system_assembler handles multiple outputs |
+| `laplace_nd` Bode NRMSE for channel model | Test Case 5 (RC channel) | Not implemented — P5.6b |
+| Transient validation for VCO idtmod model | Test Case 1 (VCO) | Not possible without EDA — Layer 4 only |
