@@ -1237,17 +1237,32 @@ the final system-level verdict.
 
 ## Appendix A — Mixed-Signal IP Examples: Analog Block → Digital Block Interfaces
 
-These are real open-source examples and derived test cases where a SPICE netlist
-(analog block) feeds its output directly into a digital Verilog/SV block, or vice
-versa. All interface types and port names are drawn from actual repositories.
+### Source verification status
 
-Sources used:
-- [lakshmi-sathi/avsdpll_1v8](https://github.com/lakshmi-sathi/avsdpll_1v8) — SKY130 transistor-level PLL
-- [manili/VSDBabySoC](https://github.com/manili/VSDBabySoC) — open-source mixed-signal SoC
-- [SparcLab/OpenSERDES](https://github.com/SparcLab/OpenSERDES) — 2 Gbps SerDes in SKY130
-- [L28E/MRCP-CDR](https://github.com/L28E/MRCP-CDR) — bang-bang CDR with Verilog-A phase rotator
-- [designers-guide.org VCO models](https://designers-guide.org/verilog-ams/functional-blocks/vco/vco.va)
-- Verilog-AMS LRM §10 (connect modules), BMAS 2000 Frey paper
+Each test case is annotated with what was directly verified from online sources vs.
+what was constructed from general knowledge of the circuit topology. All URLs were
+fetched and checked; discrepancies from the original research are documented here.
+
+| Source | URL | Verified? | Notes |
+|--------|-----|-----------|-------|
+| avsdpll_1v8 `PLL_PreLay.cir` | https://raw.githubusercontent.com/lakshmi-sathi/avsdpll_1v8/main/PreLayout/PLL_PreLay.cir | ✓ Confirmed | Contains `.subckt vco in 17`, `.subckt cp up down out`, `.subckt fd Clk 10` |
+| avsdpll_1v8 `VCO.cir` | https://raw.githubusercontent.com/lakshmi-sathi/avsdpll_1v8/main/PreLayout/VCO.cir | ✓ Confirmed | Flat testbench (47 lines); 7-stage current-starved ring osc; `sky130_fd_pr__nfet/pfet_01v8`; control input node named `in`, clock output is node `11` (buffered) |
+| avsdpll_1v8 `CP.cir` | https://raw.githubusercontent.com/lakshmi-sathi/avsdpll_1v8/main/PreLayout/CP.cir | ✓ Confirmed | Flat testbench; inputs `up`/`down` driven by voltage sources; output node `out` into RC loop filter |
+| avsdpll_1v8 `FD.cir` | https://raw.githubusercontent.com/lakshmi-sathi/avsdpll_1v8/main/PreLayout/FD.cir | ✓ Confirmed | Flat testbench; clock input `Clk`; output node `6`; **NOTE: file is `FD.cir`, not `Freq_Div.cir`** |
+| VSDBabySoC `avsddac.v` | https://raw.githubusercontent.com/manili/VSDBabySoC/main/src/module/avsddac.v | ✓ Confirmed | Behavioral Verilog (`reg real OUT`); ports: `output OUT, input [9:0] D, input VREFH, input VREFL`; **NOT a SPICE netlist** |
+| VSDBabySoC `avsdpll.v` | https://raw.githubusercontent.com/manili/VSDBabySoC/main/src/module/avsdpll.v | ✓ Confirmed | Behavioral Verilog placeholder using `$realtime`; `ENb_CP` declared but unused |
+| OpenSERDES repo | https://github.com/SparcLab/OpenSERDES | ✓ Confirmed | Dirs: `Inverter_Based_Tx`, `OverSampling_CDR`, `Resistive_FB_inverter`, `Serializer`, etc. |
+| OpenSERDES TX SPICE | `Inverter_Based_Tx/Full_TX/Inv_Transmitter.sp` | ✓ Confirmed | **Empty-stub post-LVS netlist** — `.SUBCKT` bodies are blank; not simulatable without PDK |
+| OpenSERDES CDR SPICE | `OverSampling_CDR/CLK_RECOVERY.sp` | ✓ Confirmed | 5,411 lines, layout-extracted; **synthesized digital logic**, not analog; requires SKY130 std-cell models |
+| designers-guide.org VCO | https://designers-guide.org/verilog-ams/functional-blocks/vco/vco.va | ✓ Confirmed | 203 lines; 4 modules: `vco0` (sine), `vco1` (square), `vco2` (square+jitter), `quadVco` (IQ); author Ken Kundert, 2019 |
+| L28E/MRCP-CDR | https://github.com/L28E/MRCP-CDR | ✓ Confirmed | **Purely digital Verilog** — `cdr.v`, `phase_detector.v`, `phase_rotator.v`, `filter.v`; **no Verilog-A or analog content** |
+| CML diff pair SPICE | No single repo | ✗ Constructed | Pattern derived from published Verilog-AMS literature (BMAS 2006) and standard CML topology; not from a specific downloadable file |
+
+**Key corrections from original research:**
+1. `VCO.cir`/`CP.cir`/`FD.cir` are individual block testbenches; `.subckt` port definitions are in `PLL_PreLay.cir`. The VCO subcircuit is `.subckt vco in 17` — port 2 is numeric node `17`, not a named port.
+2. `avsddac.v` is a behavioral Verilog model using `real` types, not a transistor-level SPICE netlist.
+3. OpenSERDES SPICE files are empty post-LVS stubs — the transistor content requires the closed-source PDK. The architecture is real (described in their DATE paper) but the SPICE is not directly runnable.
+4. L28E/MRCP-CDR has no Verilog-A or analog content — it is all-digital SystemVerilog.
 
 ---
 
@@ -1255,12 +1270,11 @@ Sources used:
 
 | # | Analog block | Digital block | Interface signal | Level shift needed? |
 |---|-------------|--------------|-----------------|-------------------|
-| 1 | Ring VCO (SPICE) | DFF frequency divider (Verilog) | Single-ended CMOS clock | None — same VDD rail |
-| 2 | Charge pump (SPICE) | Phase-frequency detector (Verilog gates) | `up`/`down` logic levels drive FET gates | None — CMOS logic drives FET gate directly |
-| 3 | 10-bit R-2R DAC (SPICE) | RISC-V core register output (Verilog) | 10-bit digital bus → analog voltage | Implicit via Verilog `real` type |
-| 4 | CML differential pair (SPICE) | CMOS DFF sampler (Verilog) | Differential 400 mV CML swing | Yes — `connectmodule a2d` with threshold at CML Vcm |
-| 5 | Resistive-feedback TIA/sense amp (SPICE) | Oversampling CDR logic (Verilog) | Rail-to-rail CMOS after gain restoration | None — inverter restores rails |
-| 6 | PLL behavioral model (Verilog-A) | RISC-V `clk` input (Verilog) | Multiplied clock (8x), single-ended 1.8V | None |
+| 1 | Ring VCO (SPICE, verified) | DFF frequency divider (Verilog, verified) | Single-ended CMOS clock | None — same VDD rail |
+| 2 | Charge pump (SPICE, verified) | Phase-frequency detector (Verilog gates) | `up`/`down` logic levels drive FET gates | None — CMOS logic drives FET gate directly |
+| 3 | 10-bit DAC (behavioral Verilog `real`, not SPICE) | RISC-V core register output (Verilog, verified) | 10-bit digital bus → analog voltage | Implicit via Verilog `real` type |
+| 4 | CML differential pair (constructed pattern) | CMOS DFF sampler (Verilog) | Differential 400 mV CML swing | Yes — `connectmodule a2d` with threshold at CML Vcm |
+| 5 | OpenSERDES TX+channel+RX (architecture real; SPICE stubs only) | Oversampling CDR (synthesized digital Verilog, verified) | Rail-to-rail CMOS after gain restoration | None — inverter restores rails |
 
 ---
 
@@ -1268,16 +1282,20 @@ Sources used:
 
 **What it is:** The core analog-to-digital crossing inside a PLL. The ring VCO
 output (analog oscillation) drives a chain of D flip-flop dividers (purely digital).
-This is universally present in any PLL or clock-generation circuit.
 
-**SPICE analog block (`VCO.cir` from avsdpll_1v8):**
+**Source:** `PLL_PreLay.cir` contains `.subckt vco in 17` — the individual `VCO.cir`
+is a standalone testbench for the block, not a subcircuit file. Port `in` = Vctrl;
+node `17` = clock output (internal numbering). The 7-stage current-starved ring
+oscillator topology was confirmed from `VCO.cir`.
+
+**SPICE analog block (ports from `PLL_PreLay.cir`, topology from `VCO.cir`):**
 ```spice
-* Current-starved 3-stage ring oscillator, SKY130 1.8V
-.subckt vco  in  out  VDD  GND
-* in  = Vctrl (control voltage input, ~0.4–1.6 V)
-* out = Clk_Out (clock output, rail-to-rail CMOS, 40–100 MHz)
-* Transistors: sky130_fd_pr__nfet_01v8, sky130_fd_pr__pfet_01v8
-* Ibias stages control oscillation frequency via Vctrl on gate
+* Current-starved 7-stage ring oscillator, SKY130 1.8V
+* .subckt definition lives in PLL_PreLay.cir:
+.subckt vco  in  17
+* in = Vctrl (control voltage, ~0.4–1.6 V)
+* 17 = clock output node (rail-to-rail CMOS, 40–100 MHz)
+* Transistors confirmed: sky130_fd_pr__nfet_01v8, sky130_fd_pr__pfet_01v8
 .ends
 ```
 
@@ -1330,14 +1348,20 @@ in Layer 4 (EDA testbench).
 Charge Pump, which either sources or sinks current into the loop filter. Classic
 digital-output → analog-input crossing.
 
-**SPICE analog block (`CP.cir` from avsdpll_1v8):**
+**Source:** `CP.cir` confirmed at
+`https://raw.githubusercontent.com/lakshmi-sathi/avsdpll_1v8/main/PreLayout/CP.cir`
+— flat testbench (not a subcircuit file); `.subckt cp up down out` is in `PLL_PreLay.cir`.
+Transistor names, widths, and topology inferred from the testbench node connections and
+standard SKY130 current-mirror charge pump topology. The exact W/L values below are
+illustrative — verify against `PLL_PreLay.cir` directly.
+
+**SPICE analog block (ports from `PLL_PreLay.cir`, topology from `CP.cir`):**
 ```spice
-.subckt cp  up  down  out  VDD  GND
-* up, down: logic-level inputs from PFD (0 or 1.8V CMOS)
-* out: analog current output into loop filter node (VCtrl)
-* Key transistors:
-*   xm44: sky130_fd_pr__pfet_01v8 w=420n l=150n  (sources Icp when up=1)
-*   xm31: sky130_fd_pr__nfet_01v8 w=420n l=150n  (sinks Icp when down=1)
+.subckt cp  up  down  out
+* up, down: logic-level inputs from PFD (0 or 1.8V CMOS) — confirmed node names
+* out: analog current output into loop filter (VCtrl) — confirmed node name
+* sky130_fd_pr__pfet_01v8 and sky130_fd_pr__nfet_01v8 confirmed in CP.cir
+* Exact W/L: verify in PLL_PreLay.cir
 *   xm43/xm32: bias mirror w=5.4u
 .ends
 ```
@@ -1394,17 +1418,26 @@ in the behavioral generator that current examples don't cover.
 output directly drives a DAC's digital input bus. The DAC converts it to an analog
 output voltage. Present in VSDBabySoC.
 
-**SPICE analog block (R-2R ladder DAC):**
-```spice
-.subckt avsddac  OUT  D9  D8  D7  D6  D5  D4  D3  D2  D1  D0  VREFH  VREFL  VDD  GND
-* D9..D0: 10 individual 1-bit digital inputs (CMOS logic level)
-* OUT: analog output voltage
-* VREFH, VREFL: analog reference supply
-* Implemented as binary-weighted or R-2R resistor ladder
-.ends
+**Source note:** `avsddac.v` (confirmed at
+`https://raw.githubusercontent.com/manili/VSDBabySoC/main/src/module/avsddac.v`) is a
+behavioral Verilog model using `reg real OUT` and `$realtobits` — **NOT a transistor-level
+SPICE netlist**. A transistor-level 10-bit R-2R DAC in SPICE does not exist in the
+VSDBabySoC repository. The `.subckt` interface below is inferred from the behavioral
+model's port list, which was confirmed.
+
+**Existing behavioral model (from `avsddac.v`, ports confirmed):**
+```verilog
+// VSDBabySoC/src/module/avsddac.v — behavioral Verilog (not Verilog-AMS)
+module avsddac (OUT, D, VREFH, VREFL);
+  output reg OUT;         // declared as "reg real" (Verilog-AMS real)
+  input [9:0] D;
+  input VREFH;
+  input VREFL;
+  // uses $realtobits internally for conversion
+endmodule
 ```
 
-**Target Verilog-AMS behavioral model:**
+**Target Verilog-AMS behavioral model (SynapticAMS output — upgrade of the above):**
 ```verilog
 `include "disciplines.vams"
 module DAC10bit (OUT, D, VREFH, VREFL);
@@ -1431,8 +1464,9 @@ Requires a `d2a` connect module per bit, or the bus is treated as `wreal`
 (4-state logic → real voltage) by the simulator.
 
 **Why this is a good test case:**
-Multi-bit bus interface. The SPICE netlist has 10 separate digital input terminals
-(`D9..D0`), which the behavioral generator must handle as a bus. Tests bus-width
+Multi-bit bus interface. Since there is no transistor SPICE netlist, SynapticAMS
+cannot extract parameters from DC sweep for this block — it must instead upgrade
+the behavioral Verilog model to proper Verilog-AMS. Tests bus-width
 handling in port extraction and in the `connectmodule` generation logic.
 
 ---
@@ -1445,7 +1479,15 @@ pair amplifies the incoming data signal from a lossy channel. Its differential o
 before the digital CDR can sample it. This is the interface where level-shifting is
 genuinely required.
 
-**SPICE analog block (CML differential pair RX):**
+**Source note:** No single open-source repository contains a complete, simulatable
+CML differential pair SPICE netlist with the correct topology for 180 nm. The SPICE
+block below was **constructed from published literature** — specifically the standard
+NFET differential pair + resistive load topology described in Razavi, "Design of Analog
+CMOS Integrated Circuits" (2e), Ch. 4, and Verilog-AMS behavioral modeling examples
+from BMAS 2006. The transistor parameters (W=20u, L=0.18u, Rc=200Ω) are representative
+of 180 nm CML but are not from a specific downloadable file.
+
+**Constructed SPICE analog block (CML differential pair RX — representative topology):**
 ```spice
 .subckt cml_rx  inp  inn  outp  outn  vdd  vss  ibias
 * inp, inn:  differential data input (~100 mV swing from channel)
@@ -1545,13 +1587,23 @@ most complete end-to-end test of the system integration pipeline.
 (analog, SPICE) → RC lossy channel (passive analog) → RX sense amp (analog) →
 CDR (digital). Two analog-digital crossings in one signal chain.
 
-**TX crossing: Digital serializer → Analog inverter chain driver:**
+**Source note:** The OpenSERDES repository (https://github.com/SparcLab/OpenSERDES)
+was confirmed. The TX SPICE file `Inverter_Based_Tx/Full_TX/Inv_Transmitter.sp` is an
+**empty-stub post-LVS netlist** — `.SUBCKT` bodies contain no transistors and require the
+closed-source SKY130 PDK to be populated. The architecture (inverter-chain TX, resistive-FB
+RX, oversampling CDR) is real and described in the OpenSERDES DATE 2020 paper, but the SPICE
+is not directly runnable. The TX SPICE block, RC channel, and RX SPICE block below are
+**constructed from the architecture description** using standard CMOS inverter-chain topology.
+The digital CDR Verilog (`OverSampling_CDR/CLK_RECOVERY.sp`) is synthesized gate-level
+logic, not behavioral RTL, and requires SKY130 std-cell models to simulate.
+
+**Constructed TX crossing: Digital serializer → Analog inverter chain driver (architecture from OpenSERDES DATE 2020):**
 ```spice
-* OpenSERDES TX driver (Inverter_Based_Tx)
+* TX driver topology from OpenSERDES architecture — SPICE subcircuit bodies are empty in the repo
 .subckt tx_driver  data_in  txp  txn  VDD  GND
 * data_in: CMOS logic level from digital serializer
 * txp, txn: differential output to channel (~800mV single-ended swing)
-* Topology: CMOS inverter chain + PTAT current for 50Ω termination
+* Topology: CMOS inverter chain + PTAT current for 50Ω termination (from paper)
 .ends
 ```
 
