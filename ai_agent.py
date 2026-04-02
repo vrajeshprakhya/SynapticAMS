@@ -23,7 +23,7 @@ Generate a Verilog-AMS (.va) file that replicates a circuit's transfer character
 - First line MUST be: `include "disciplines.vams"
 - When using laplace_nd or tau, also add: `include "constants.vams"
 - Module declaration ends with semicolon: module NAME (out, in);
-- Port declarations: electrical out, in;
+- Port declarations: output electrical out; input electrical in;  (MUST use input/output keywords — NOT "electrical out, in;")
 - Parameters: parameter real name = value;
 - Contribution: V(out) <+ expression;
 - Always clamp to rails: V(out) <+ min(voh, max(vol, expression));
@@ -33,7 +33,8 @@ Generate a Verilog-AMS (.va) file that replicates a circuit's transfer character
 
 `include "disciplines.vams"
 module DIFF_AMP (out, in);
-  electrical out, in;
+  output electrical out;
+  input electrical in;
   parameter real voh  = 1.8;
   parameter real vol  = 0.2;
   parameter real vth  = 0.9;
@@ -48,7 +49,8 @@ endmodule
 `include "disciplines.vams"
 `include "constants.vams"
 module CML_RX (out, in);
-  electrical out, in;
+  output electrical out;
+  input electrical in;
   parameter real voh  = 1.8;
   parameter real vol  = 1.0;
   parameter real vth  = 0.9;
@@ -62,6 +64,19 @@ endmodule
 laplace_nd(signal, {num}, {den}) models H(s)=N(s)/D(s).
 For a first-order lowpass H(s)=1/(1+s*tau): use num={1.0}, den={1.0, tau}.
 (V(in) - vth) centres amplification on the correct bias point — never omit it."""
+
+
+def _build_system_prompt(client_context: str | None = None) -> str:
+    """
+    Return the system prompt, optionally extended with per-client RAG context.
+
+    Args:
+        client_context: formatted string returned by ClientStore.get_context().
+                        If None or empty, returns the base SYSTEM_PROMPT unchanged.
+    """
+    if not client_context:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT + "\n\n" + client_context
 
 
 # ── Prompt builders ────────────────────────────────────────────────────
@@ -159,7 +174,8 @@ def _build_prompt(netlist, x, y, info, metrics=None, ac_metrics=None, baseline_v
             skel.append('`include "constants.vams"')
         skel += [
             "module BEHAVIORAL_MODEL (out, in);",
-            "  electrical out, in;",
+            "  output electrical out;",
+            "  input electrical in;",
             f"  parameter real voh  = {voh:.4f};   // output high rail",
             f"  parameter real vol  = {vol:.4f};   // output low rail",
             f"  parameter real vth  = {vth:.4f};   // input threshold",
@@ -571,12 +587,13 @@ def create_agent(provider=None, model=None):
 
 # ── Public API ─────────────────────────────────────────────────────────
 
-def generate(agent, netlist, x, y, info, metrics=None, ac_metrics=None, baseline_va=None):
+def generate(agent, netlist, x, y, info, metrics=None, ac_metrics=None,
+             baseline_va=None, client_context=None):
     """Initial Verilog-AMS generation."""
     name = f"{type(agent).__name__}/{getattr(agent, 'model', '?')}"
     print(f"      [{name}] generating...", end="", flush=True)
     code = clean_code(agent.chat(
-        SYSTEM_PROMPT,
+        _build_system_prompt(client_context),
         _build_prompt(netlist, x, y, info, metrics=metrics, ac_metrics=ac_metrics,
                       baseline_va=baseline_va),
     ))
@@ -584,12 +601,12 @@ def generate(agent, netlist, x, y, info, metrics=None, ac_metrics=None, baseline
     return code
 
 
-def refine(agent, netlist, x, y, info, current_code, nrmse):
+def refine(agent, netlist, x, y, info, current_code, nrmse, client_context=None):
     """Refine Verilog-AMS given the current NRMSE."""
     name = f"{type(agent).__name__}/{getattr(agent, 'model', '?')}"
     print(f"      [{name}] refining (NRMSE={nrmse:.4f})...", end="", flush=True)
     code = clean_code(agent.chat(
-        SYSTEM_PROMPT,
+        _build_system_prompt(client_context),
         _build_refine_prompt(netlist, x, y, info, current_code, nrmse),
     ))
     print(" done")
@@ -640,7 +657,8 @@ def generate_vco_va(vco_metrics, module_name="VCO_RING5"):
 // In a full PLL: Vctrl is driven by the charge-pump loop filter.
 // The loop locks when f_inst = N * f_ref_input (N = divider ratio).
 module {module_name} (out, ctrl);
-  electrical out, ctrl;
+  output electrical out;
+  input electrical ctrl;
 
   // ── Extracted VCO parameters ─────────────────────────────────
   parameter real Kvco      = {kvco:.6e};   // Hz/V

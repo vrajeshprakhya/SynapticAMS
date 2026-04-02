@@ -1,0 +1,6 @@
+{
+    "name": "Apple Inc.",
+    "preferred_discipline": "EENet",
+    "style_summary": "Use EENet discipline for all nets. Module names use PascalCase. Parameters declared with descriptive comments. Prefer laplace_nd for bandwidth-limited blocks.",
+    "max_context_docs": 2
+}

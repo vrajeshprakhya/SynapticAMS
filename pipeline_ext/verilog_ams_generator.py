@@ -142,9 +142,14 @@ class VerilogAMSGenerator:
         code += f"    input electrical {input_clean}\n"
         code += ");\n\n"
 
+        # Collect all parameters: top-level AND from each region
+        all_params = dict(params)
+        for region in regions:
+            all_params.update(region.get('params', {}))
+
         # Parameters
         code += "    // Model parameters\n"
-        for key, value in params.items():
+        for key, value in all_params.items():
             code += f"    parameter real {key} = {value:.12e};\n"
         code += "\n"
 
@@ -231,7 +236,10 @@ class VerilogAMSGenerator:
             else:
                 code += "(1)  // default\n"
 
-            expr = self._translate_expr(region['expr'], input_name, params)
+            # Merge top-level params with region-level params for expression translation
+            region_params = dict(params)
+            region_params.update(region.get('params', {}))
+            expr = self._translate_expr(region['expr'], input_name, region_params)
             code += f"            y_out = {expr};\n"
 
         code += "\n        // Use current source with output resistance (Thevenin equivalent)\n"

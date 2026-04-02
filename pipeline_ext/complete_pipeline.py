@@ -133,13 +133,15 @@ def extract_device_bias(netlist_text, device_name):
 
     return bias
 
-def spice_to_verilog_ams(netlist_text, output_dir='.'):
+def spice_to_verilog_ams(netlist_text, output_dir='.', client_id=None):
     """
     Complete pipeline: SPICE netlist → Verilog-AMS modules
 
     Args:
         netlist_text: SPICE netlist as string
         output_dir: Directory to save .va files
+        client_id: Optional client identifier for per-client RAG context
+                   (matches a subdirectory under clients/).
 
     Returns:
         list: Paths to generated .va files
@@ -147,6 +149,20 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
     print("="*70)
     print(" SPICE → VERILOG-AMS PIPELINE")
     print("="*70)
+
+    # Load per-client RAG context (empty string when client_id is None).
+    client_context = ""
+    if client_id:
+        try:
+            from rag.client_store import ClientStore
+            store = ClientStore(client_id)
+            client_context = store.get_context()
+            if client_context:
+                print(f"\n[RAG] Context loaded for client '{client_id}'")
+            else:
+                print(f"\n[RAG] No docs found for client '{client_id}'")
+        except Exception as e:
+            print(f"\n[RAG] Lookup failed ({e}) — continuing without client context")
 
     # Step 0: Flatten netlist (expand subcircuits)
     print("\n[0/7] Flattening netlist (expanding subcircuits)...")
@@ -483,7 +499,7 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
                     if z.shape != expected_shape:
                         raise ValueError(f"Data shape mismatch: z.shape={z.shape}, expected {expected_shape}")
 
-                    from pipeline_ext.fit_transfer_function import fit_transfer_function_2d
+                    from pipeline_ext.fit_transfer_function import fit_transfer_function_2d, fit_transfer_function
                     model = fit_transfer_function_2d(x1, x2, z)
 
                     print(f" → {model['model_type']} ({model['intent']})")
@@ -496,7 +512,33 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
                     })
 
                 except Exception as e:
-                    print(f" → Failed: {e}")
+                    # 2D fitting failed — fall back to 1D marginal fits on each axis
+                    print(f" → Failed 2D ({e}), trying 1D marginals")
+                    try:
+                        import numpy as _np
+                        z_arr = _np.array(z) if not hasattr(z, 'ndim') else z
+                        # Fit output vs sweep_var_1 (average over sweep_var_2)
+                        if z_arr.ndim == 2:
+                            y1 = _np.mean(z_arr, axis=1)  # shape (len(x1),)
+                            y2 = _np.mean(z_arr, axis=0)  # shape (len(x2),)
+                        else:
+                            y1 = z_arr[:len(x1)]
+                            y2 = z_arr[:len(x2)]
+                        for sx, sy, sv in [(x1, y1, sweep_var_1), (x2, y2, sweep_var_2)]:
+                            try:
+                                m1d = fit_transfer_function(_np.array(sx), _np.array(sy))
+                                print(f"          {obs_var} = f({sv}) → {m1d['model_type']} (1D fallback)")
+                                fitted_models.append({
+                                    'input': sv,
+                                    'output': obs_var,
+                                    'model': m1d,
+                                    'data': {'x': _np.array(sx), 'y': _np.array(sy)}
+                                })
+                                break  # Use first successful 1D fit
+                            except Exception:
+                                continue
+                    except Exception as e2:
+                        print(f"          1D fallback also failed: {e2}")
 
             continue
 
@@ -772,7 +814,10 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
 
     if OSDI_AVAILABLE:
         print("\n[7/8] Checking equivalence with OSDI...")
-        osdi_checker = OSDIEquivalenceChecker(abs_tol=0.01, rel_tol=0.05)
+        from pathlib import Path as _Path
+        _tb_dir = _Path(output_dir) / "testbenches"
+        osdi_checker = OSDIEquivalenceChecker(abs_tol=0.01, rel_tol=0.05,
+                                              testbench_output_dir=str(_tb_dir))
     else:
         print("\n[7/8] Skipping OSDI equivalence check (OpenVAF not available)...")
         print("      Install OpenVAF for equivalence validation")
@@ -972,6 +1017,19 @@ def spice_to_verilog_ams(netlist_text, output_dir='.'):
         print(f"    Passed:               {passed}")
         if failed > 0:
             print(f"    Failed:               {failed}")
+
+    # System integration: assemble a top-level system_top.va when multiple
+    # blocks were generated (P3 — heuristic port wiring, engineer reviews stubs).
+    va_files = [f for f in saved_files if str(f).endswith('.va')]
+    if len(va_files) > 1:
+        try:
+            from system_assembler import assemble_system
+            system_va = assemble_system(va_files, output_dir,
+                                        system_name="system_top",
+                                        client_id=client_id)
+            print(f"\n  System top-level:       {system_va.name}")
+        except Exception as e:
+            print(f"\n  System assembly skipped ({e})")
 
     return saved_files
 

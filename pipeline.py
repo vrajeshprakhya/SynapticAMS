@@ -857,7 +857,8 @@ def _is_dynamic_model(va_code):
 def run_pipeline(netlist_text, output_dir=".",
                  max_iterations=MAX_ITERATIONS,
                  nrmse_threshold=NRMSE_THRESHOLD,
-                 provider=None, ai_model=None):
+                 provider=None, ai_model=None,
+                 client_id=None):
     """
     Full pipeline: SPICE netlist → Verilog-AMS via AI + feedback loop.
 
@@ -882,6 +883,24 @@ def run_pipeline(netlist_text, output_dir=".",
     print(f"      Signal source : {info['signal_source']}")
     print(f"      Output node   : {info['output_node']}")
     print(f"      Supply        : {info['vdd']} V")
+
+    # Load per-client RAG context (empty string when client_id is None).
+    client_context = ""
+    if client_id:
+        try:
+            from rag.client_store import ClientStore
+            store = ClientStore(client_id)
+            circuit_hints = {
+                "module_name":   info.get("output_node", ""),
+                "signal_source": info.get("signal_source", ""),
+            }
+            client_context = store.get_context(circuit_hints)
+            if client_context:
+                print(f"      RAG context loaded for client '{client_id}'")
+            else:
+                print(f"      RAG: no docs found for client '{client_id}'")
+        except Exception as e:
+            print(f"      RAG lookup failed ({e}) — continuing without client context")
 
     # ── Step 2: DC sweep ─────────────────────────────────────────────
     print("\n[2/5] Running ngspice DC sweep (golden truth)...")
@@ -957,7 +976,8 @@ def run_pipeline(netlist_text, output_dir=".",
     print("\n[4/5] AI Agent generating Verilog-AMS...")
     agent   = create_agent(provider=provider, model=ai_model)
     va_code = generate(agent, netlist_text, x, y, info,
-                       metrics=metrics, ac_metrics=ac_metrics)
+                       metrics=metrics, ac_metrics=ac_metrics,
+                       client_context=client_context or None)
     va_code = clean_code(va_code)  # Strip LLM preamble and fix syntax
 
     final_nrmse = None
@@ -981,7 +1001,8 @@ def run_pipeline(netlist_text, output_dir=".",
                     break
                 if i < max_iterations - 1:
                     va_code = refine(agent, netlist_text, x, y, info,
-                                     va_code, nrmse)
+                                     va_code, nrmse,
+                                     client_context=client_context or None)
                     va_code = clean_code(va_code)  # Clean after each refinement
     else:
         print("      (no simulation data — skipping NRMSE evaluation)")
@@ -1001,6 +1022,14 @@ def run_pipeline(netlist_text, output_dir=".",
             print(f"      plots  : {plot_path}")
         else:
             print("      plots  : (matplotlib not installed — skipped)")
+
+    # Export standalone testbench (ngspice-compatible DC sweep).
+    try:
+        from testbench_exporter import export_testbench
+        export_testbench(va_code=va_code, spice_netlist=netlist_text,
+                         info=info, x=x, y=y, output_dir=output_dir)
+    except Exception as e:
+        print(f"      testbench: export failed ({e})")
 
     print(f"\n{'=' * 68}")
     if final_nrmse is not None:

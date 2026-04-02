@@ -1,0 +1,29 @@
+// (c) Apple Inc. — Confidential
+// Module: CmlBuffer
+// Style: Apple EENet differential CML stage behavioral model
+// Generated: SynapticAMS (reference example)
+
+`include "disciplines.vams"
+`include "constants.vams"
+
+module CmlBuffer (out_p, out_n, in_p, in_n);
+  output EENet out_p;
+  output EENet out_n;
+  input  EENet in_p;
+  input  EENet in_n;
+
+  // ── Extracted parameters ─────────────────────────────────────────
+  parameter real voh  = 1.6;       // V  — output high voltage
+  parameter real vol  = 1.0;       // V  — output low voltage
+  parameter real vth  = 0.0;       // V  — differential threshold (typ. 0)
+  parameter real gain = 4.5;       // V/V — differential gain
+  parameter real tau  = 7.96e-10;  // s  — dominant pole (first-order lowpass)
+
+  real vdiff;
+
+  analog begin
+    vdiff = V(in_p) - V(in_n);
+    V(out_p) <+ min(voh, max(vol, (voh+vol)/2.0 + gain * laplace_nd(vdiff - vth, {1.0}, {1.0, tau})));
+    V(out_n) <+ min(voh, max(vol, (voh+vol)/2.0 - gain * laplace_nd(vdiff - vth, {1.0}, {1.0, tau})));
+  end
+endmodule

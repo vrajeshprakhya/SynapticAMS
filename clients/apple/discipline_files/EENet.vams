@@ -1,0 +1,27 @@
+// EENet — Apple proprietary electrical discipline for high-speed mixed-signal nets
+// Version: 3.2 (placeholder — replace with actual client document)
+//
+// EENet extends the standard 'electrical' discipline with tighter default
+// tolerances and an explicit reference node (EEGROUND) distinct from the
+// global ground net.
+//
+// Usage:
+//   EENet my_signal;          // high-speed differential signal
+//   EENet my_bus[3:0];        // 4-bit bus
+//
+// Compatible disciplines (for port connections in system-level assemblies):
+//   electrical  — connect via resolver; small mismatch in tolerance acceptable
+//   wreal       — NOT compatible; use EENet-to-wreal bridge module
+//
+// Naming conventions enforced by Apple DRC:
+//   - Differential pairs:  <name>_p / <name>_n   (e.g., tx_out_p / tx_out_n)
+//   - Supply rails:        VDD_<domain>            (e.g., VDD_IO, VDD_CORE)
+//   - Reference:           VSS_<domain>            (e.g., VSS_CORE)
+//   - Clocks:              CLK_<domain>_<rate>     (e.g., CLK_CORE_8G)
+
+`include "disciplines.vams"
+
+discipline EENet
+    potential Voltage;
+    flow Current;
+enddiscipline
