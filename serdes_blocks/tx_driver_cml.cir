@@ -1,0 +1,59 @@
+* TX CML Driver (Differential Output)
+* =====================================
+* Subcircuit: tx_driver_cml
+* Ports: inp inn outp outn vdd gnd
+*
+* NMOS differential switch pair (Current Mode Logic).
+* Tail current source (4 mA ideal) provides full current steering.
+* Load resistors (50 Ω termination) are external — see tx_termination.cir.
+*
+* At full steering (|Vdiff| > ~300 mV):
+*   One transistor carries 4 mA, other carries 0 mA.
+*   With 50 Ω load: ΔV per side = 4 mA × 50 Ω = 200 mV → 400 mVppd diff.
+*
+* Transistor sizing: W=20µm, L=0.18µm → W/L=111
+*   gm ≈ sqrt(2 × KP × W/L × ID) = sqrt(2 × 200µ × 111 × 2m) ≈ 9.4 mA/V
+*   at quiescent (2 mA per transistor = I_tail/2)
+*
+* Reference: Palermo, ECEN720 Lecture 5 — "TX Driver & Termination",
+*            Texas A&M University (ecen689/lecture5_ee720_termination_txdriver)
+* Compatible: ngspice 38+
+
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.45 KP=200u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+
+* ── Subcircuit ──────────────────────────────────────────────────────────────
+.SUBCKT tx_driver_cml  inp  inn  outp  outn  vdd  gnd
+* Differential switch pair (bulk = gnd = p-substrate)
+M1  outp  inp  tail  gnd  NMOS  W=20u  L=0.18u
+M2  outn  inn  tail  gnd  NMOS  W=20u  L=0.18u
+* Ideal tail current source — sinks 4 mA from tail node to GND.
+* Models a biased NMOS current mirror in a real IC.
+I_tail  tail  gnd  DC  4m
+.ENDS tx_driver_cml
+
+* ── Standalone Testbench ─────────────────────────────────────────────────────
+* Run: ngspice tx_driver_cml.cir
+*
+* Adds 50 Ω termination loads inline (normally provided by tx_termination.cir).
+* Sweeps: Vinp  0.60 V → 1.20 V   (Vinn fixed at 0.90 V common-mode)
+* Expect: drv_outp traces S-curve 1.8 V → 1.6 V; drv_outn traces inverse.
+*         Differential v(drv_outp,drv_outn) swings ≈ ±200 mV = 400 mVppd.
+
+VDD   vdd  0  DC 1.8
+
+* Differential input sources (Vinn = CM reference; Vinp swept by .DC)
+Vinp  tx_inp  0  DC 0.9
+Vinn  tx_inn  0  DC 0.9
+
+* TX driver instance
+X_DRV  tx_inp  tx_inn  drv_outp  drv_outn  vdd  0  tx_driver_cml
+
+* 50 Ω load / source termination (inline model of tx_termination.cir)
+Rterm_p  vdd  drv_outp  50
+Rterm_n  vdd  drv_outn  50
+
+.DC  Vinp  0.60  1.20  0.003
+
+.PRINT DC v(drv_outp) v(drv_outn) v(drv_outp,drv_outn)
+
+.END

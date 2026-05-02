@@ -1,0 +1,189 @@
+* Full SERDES Analog Chain Testbench
+* =====================================
+* TX Driver → TX Termination → Channel → RX Termination+ESD → CTLE
+*
+* This self-contained testbench instantiates the five analog blocks from
+* diagram.md and exercises the complete signal path.
+*
+* Signal path:
+*   Vin (differential PULSE, 2 Gbps)
+*     → X_TXD  (tx_driver_cml)       NMOS diff pair, 4 mA tail
+*     → X_TXT  (tx_termination)      50 Ω source termination
+*     → X_CH   (channel_model)       30" FR4 + 2×SMA connector
+*     → X_RXT  (rx_termination_esd)  AC coupling + 100 Ω diff term + ESD
+*     → X_CTLE (ctle)                RC-degenerated diff pair, 1 GHz zero
+*
+* Stimuli:
+*   PULSE, 2 Gbps (500 ps period, 100 ps edges):
+*     Vinp: 0.9 V baseline, swings to 1.2 V (300 mV amplitude)
+*     Vinn: 0.9 V fixed (differential drive: Vdiff = Vinp − Vinn)
+*
+* Observed nodes:
+*   tx_outp/tx_outn    — after TX driver + termination
+*   ch_outp/ch_outn    — after 30" channel
+*   ctle_outp/ctle_outn — after RX front-end + CTLE (equalized)
+*
+* Both TRAN and AC analyses are included:
+*   .TRAN 5p 10n   — eye diagram at 2 Gbps (20 UI in 10 ns)
+*   .AC  DEC 100 1Meg 50Gig — end-to-end chain frequency response
+*
+* Compatible: ngspice 38+
+
+* ── MOSFET Models ────────────────────────────────────────────────────────────
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.45 KP=200u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+
+* ── ESD Diode Model ──────────────────────────────────────────────────────────
+.MODEL DIO_ESD D (IS=1e-14 RS=5 N=1.1 CJO=50f BV=5.5 IBV=1u)
+
+* ── Block 1: TX CML Driver ───────────────────────────────────────────────────
+.SUBCKT tx_driver_cml  inp  inn  outp  outn  vdd  gnd
+M1      outp  inp  tail  gnd  NMOS  W=20u  L=0.18u
+M2      outn  inn  tail  gnd  NMOS  W=20u  L=0.18u
+I_tail  tail  gnd  DC  4m
+.ENDS tx_driver_cml
+
+* ── Block 2: TX On-Chip Termination ──────────────────────────────────────────
+.SUBCKT tx_termination  outp  outn  vdd
+Rterm_p  vdd  outp  50
+Rterm_n  vdd  outn  50
+.ENDS tx_termination
+
+* ── Block 3: Channel Model (30" FR4 + 2×SMA) ─────────────────────────────────
+.SUBCKT channel_model  inp  inn  outp  outn  gnd
+Rcx1p  inp   cx1p  2
+Lcx1p  cx1p  cx2p  1n
+Ccx1p  cx2p  gnd   0.5p
+Rcx1n  inn   cx1n  2
+Lcx1n  cx1n  cx2n  1n
+Ccx1n  cx2n  gnd   0.5p
+R1p   cx2p  s1p   0.76
+L1p   s1p   p01   26.1n
+C1p   p01   gnd   10.4p
+R2p   p01   s2p   0.76
+L2p   s2p   p02   26.1n
+C2p   p02   gnd   10.4p
+R3p   p02   s3p   0.76
+L3p   s3p   p03   26.1n
+C3p   p03   gnd   10.4p
+R4p   p03   s4p   0.76
+L4p   s4p   p04   26.1n
+C4p   p04   gnd   10.4p
+R5p   p04   s5p   0.76
+L5p   s5p   p05   26.1n
+C5p   p05   gnd   10.4p
+R6p   p05   s6p   0.76
+L6p   s6p   p06   26.1n
+C6p   p06   gnd   10.4p
+R7p   p06   s7p   0.76
+L7p   s7p   p07   26.1n
+C7p   p07   gnd   10.4p
+R8p   p07   s8p   0.76
+L8p   s8p   p08   26.1n
+C8p   p08   gnd   10.4p
+R9p   p08   s9p   0.76
+L9p   s9p   p09   26.1n
+C9p   p09   gnd   10.4p
+R10p  p09   s10p  0.76
+L10p  s10p  p10   26.1n
+C10p  p10   gnd   10.4p
+R1n   cx2n  s1n   0.76
+L1n   s1n   n01   26.1n
+C1n   n01   gnd   10.4p
+R2n   n01   s2n   0.76
+L2n   s2n   n02   26.1n
+C2n   n02   gnd   10.4p
+R3n   n02   s3n   0.76
+L3n   s3n   n03   26.1n
+C3n   n03   gnd   10.4p
+R4n   n03   s4n   0.76
+L4n   s4n   n04   26.1n
+C4n   n04   gnd   10.4p
+R5n   n04   s5n   0.76
+L5n   s5n   n05   26.1n
+C5n   n05   gnd   10.4p
+R6n   n05   s6n   0.76
+L6n   s6n   n06   26.1n
+C6n   n06   gnd   10.4p
+R7n   n06   s7n   0.76
+L7n   s7n   n07   26.1n
+C7n   n07   gnd   10.4p
+R8n   n07   s8n   0.76
+L8n   s8n   n08   26.1n
+C8n   n08   gnd   10.4p
+R9n   n08   s9n   0.76
+L9n   s9n   n09   26.1n
+C9n   n09   gnd   10.4p
+R10n  n09   s10n  0.76
+L10n  s10n  n10   26.1n
+C10n  n10   gnd   10.4p
+Rcx2p  p10   cx3p  2
+Lcx2p  cx3p  outp  1n
+Ccx2p  outp  gnd   0.5p
+Rcx2n  n10   cx3n  2
+Lcx2n  cx3n  outn  1n
+Ccx2n  outn  gnd   0.5p
+.ENDS channel_model
+
+* ── Block 4: RX Termination + ESD Protection ─────────────────────────────────
+.SUBCKT rx_termination_esd  inp  inn  rxp  rxn  vdd  vtt  gnd
+Cac_p   inp  acp  1p
+Cac_n   inn  acn  1p
+Rbias_p  acp  vtt  10k
+Rbias_n  acn  vtt  10k
+Rterm    acp  acn  100
+D_p_hi  acp  vdd  DIO_ESD
+D_p_lo  gnd  acp  DIO_ESD
+D_n_hi  acn  vdd  DIO_ESD
+D_n_lo  gnd  acn  DIO_ESD
+Rout_p  acp  rxp  0.01
+Rout_n  acn  rxn  0.01
+.ENDS rx_termination_esd
+
+* ── Block 5: CTLE ────────────────────────────────────────────────────────────
+.SUBCKT ctle  inp  inn  outp  outn  vdd  gnd
+M1      outp  inp  s1  gnd  NMOS  W=20u  L=0.18u
+M2      outn  inn  s2  gnd  NMOS  W=20u  L=0.18u
+RD1     vdd  outp  500
+RD2     vdd  outn  500
+RS1     s1  tail  200
+CS1     s1  tail  800f
+RS2     s2  tail  200
+CS2     s2  tail  800f
+I_tail  tail  gnd  DC  2m
+.ENDS ctle
+
+* ── Power Supplies ───────────────────────────────────────────────────────────
+VDD  vdd  0  DC 1.8
+VTT  vtt  0  DC 0.9
+
+* ── TX Differential Input Stimulus ──────────────────────────────────────────
+* 2 Gbps NRZ pattern: 500 ps period, 100 ps rise/fall edges
+* Vinp swings 0.9 V → 1.2 V (300 mV amplitude, +150 mV around CM)
+* Vinn is fixed at 0.9 V common-mode → differential Vdiff = ±150 mV
+Vinp  tx_inp  0  PULSE(0.9 1.2 200p 100p 100p 250p 500p)
+Vinn  tx_inn  0  DC 0.9
+
+* ── Block Instantiations ─────────────────────────────────────────────────────
+* TX Driver: high-Z current-source output (no loads yet)
+X_TXD  tx_inp  tx_inn  tx_outp  tx_outn  vdd  0  tx_driver_cml
+
+* TX Termination: adds 50 Ω loads to the TX output nodes
+X_TXT  tx_outp  tx_outn  vdd  tx_termination
+
+* Channel: 30" FR4 differential trace + 2 SMA connectors
+X_CH   tx_outp  tx_outn  ch_outp  ch_outn  0  channel_model
+
+* RX Termination + ESD: AC coupling, CM bias, diff termination, ESD clamps
+X_RXT  ch_outp  ch_outn  rx_inp  rx_inn  vdd  vtt  0  rx_termination_esd
+
+* CTLE: RC-degenerated diff pair, 1 GHz zero, 7 dB peaking
+X_CTLE  rx_inp  rx_inn  ctle_outp  ctle_outn  vdd  0  ctle
+
+* ── Transient Analysis — Eye Diagram at 2 Gbps ───────────────────────────────
+* 10 ns window captures 20 bit periods (UI = 500 ps)
+* 5 ps timestep resolves 100 ps edges with 20× oversampling
+.TRAN 5p 10n
+
+.PRINT TRAN v(tx_outp) v(tx_outn) v(ch_outp) v(ch_outn) v(ctle_outp) v(ctle_outn)
+
+.END

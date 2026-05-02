@@ -1,0 +1,169 @@
+* Channel Model — PCB Trace + Connectors (Differential)
+* ========================================================
+* Subcircuit: channel_model
+* Ports: inp inn outp outn gnd
+*
+* Models a 30" (762 mm) FR4 PCB differential trace plus two SMA connectors
+* using a 10-section RLC ladder for each conductor (balanced differential).
+*
+* Physical parameters (50 Ω microstrip, εr = 4.2 FR4):
+*   Z₀ = 50 Ω, velocity = c/√εr = 1.46×10⁸ m/s
+*   L/m = Z₀/v      = 342 nH/m  → L_total = 261 nH
+*   C/m = 1/(Z₀·v)  = 137 pF/m  → C_total = 104 pF
+*   R/m ≈ 10 Ω/m (skin-effect approx at 5 GHz Nyquist for 10 Gbps)
+*         → R_total = 7.6 Ω
+*
+* Per section (10 sections, 76.2 mm each):
+*   Rsec = 0.76 Ω  (series conductor loss)
+*   Lsec = 26.1 nH (series inductance)
+*   Csec = 10.4 pF (shunt capacitance to GND)
+*
+* SMA connector model (×2, TX-side and RX-side):
+*   R = 2 Ω, L = 1 nH (series), C = 0.5 pF (shunt)
+*
+* Expected AC insertion loss (single-ended, with 50 Ω source/load):
+*   ≤ −3 dB  at 300 MHz (start of rolloff)
+*   ≤ −15 dB at 5 GHz   (Nyquist for 10 Gbps)
+*   ≤ −25 dB at 15 GHz  (3rd harmonic)
+*
+* Reference: FR4 microstrip design equations per IPC-2141; connector
+*            parasitics typical for SMA connectors per Molex AN
+* Compatible: ngspice 38+  (L elements are short circuits in .OP/.DC)
+
+* ── Subcircuit ──────────────────────────────────────────────────────────────
+.SUBCKT channel_model  inp  inn  outp  outn  gnd
+
+* ── TX-side SMA Connector (Positive Path) ───────────────────────────────────
+Rcx1p  inp   cx1p  2
+Lcx1p  cx1p  cx2p  1n
+Ccx1p  cx2p  gnd   0.5p
+
+* ── TX-side SMA Connector (Negative Path) ───────────────────────────────────
+Rcx1n  inn   cx1n  2
+Lcx1n  cx1n  cx2n  1n
+Ccx1n  cx2n  gnd   0.5p
+
+* ── 10-Section RLC Ladder — Positive Path ───────────────────────────────────
+* Each section: Rsec (series loss) → Lsec (series inductance) → Csec (shunt cap)
+R1p   cx2p  s1p   0.76
+L1p   s1p   p01   26.1n
+C1p   p01   gnd   10.4p
+
+R2p   p01   s2p   0.76
+L2p   s2p   p02   26.1n
+C2p   p02   gnd   10.4p
+
+R3p   p02   s3p   0.76
+L3p   s3p   p03   26.1n
+C3p   p03   gnd   10.4p
+
+R4p   p03   s4p   0.76
+L4p   s4p   p04   26.1n
+C4p   p04   gnd   10.4p
+
+R5p   p04   s5p   0.76
+L5p   s5p   p05   26.1n
+C5p   p05   gnd   10.4p
+
+R6p   p05   s6p   0.76
+L6p   s6p   p06   26.1n
+C6p   p06   gnd   10.4p
+
+R7p   p06   s7p   0.76
+L7p   s7p   p07   26.1n
+C7p   p07   gnd   10.4p
+
+R8p   p07   s8p   0.76
+L8p   s8p   p08   26.1n
+C8p   p08   gnd   10.4p
+
+R9p   p08   s9p   0.76
+L9p   s9p   p09   26.1n
+C9p   p09   gnd   10.4p
+
+R10p  p09   s10p  0.76
+L10p  s10p  p10   26.1n
+C10p  p10   gnd   10.4p
+
+* ── 10-Section RLC Ladder — Negative Path ───────────────────────────────────
+R1n   cx2n  s1n   0.76
+L1n   s1n   n01   26.1n
+C1n   n01   gnd   10.4p
+
+R2n   n01   s2n   0.76
+L2n   s2n   n02   26.1n
+C2n   n02   gnd   10.4p
+
+R3n   n02   s3n   0.76
+L3n   s3n   n03   26.1n
+C3n   n03   gnd   10.4p
+
+R4n   n03   s4n   0.76
+L4n   s4n   n04   26.1n
+C4n   n04   gnd   10.4p
+
+R5n   n04   s5n   0.76
+L5n   s5n   n05   26.1n
+C5n   n05   gnd   10.4p
+
+R6n   n05   s6n   0.76
+L6n   s6n   n06   26.1n
+C6n   n06   gnd   10.4p
+
+R7n   n06   s7n   0.76
+L7n   s7n   n07   26.1n
+C7n   n07   gnd   10.4p
+
+R8n   n07   s8n   0.76
+L8n   s8n   n08   26.1n
+C8n   n08   gnd   10.4p
+
+R9n   n08   s9n   0.76
+L9n   s9n   n09   26.1n
+C9n   n09   gnd   10.4p
+
+R10n  n09   s10n  0.76
+L10n  s10n  n10   26.1n
+C10n  n10   gnd   10.4p
+
+* ── RX-side SMA Connector (Positive Path) ───────────────────────────────────
+Rcx2p  p10   cx3p  2
+Lcx2p  cx3p  outp  1n
+Ccx2p  outp  gnd   0.5p
+
+* ── RX-side SMA Connector (Negative Path) ───────────────────────────────────
+Rcx2n  n10   cx3n  2
+Lcx2n  cx3n  outn  1n
+Ccx2n  outn  gnd   0.5p
+
+.ENDS channel_model
+
+* ── Standalone Testbench ─────────────────────────────────────────────────────
+* Run: ngspice channel_model.cir
+*
+* Single-ended AC drive (inp) with 50 Ω source impedance; inn tied to GND.
+* 50 Ω receiver loads on outp and outn.
+* Measures S21-equivalent: v(outp) / v(vin_src) as a function of frequency.
+*
+* Expected:
+*   0 dB   at DC (resistive divider: 50/(50+4+0.76×10+2) ≈ −2 dB correction)
+*   ≤ −15 dB at 5 GHz Nyquist (10 Gbps link)
+
+* Source: 50 Ω Thevenin equivalent for TX output impedance
+Vsrc   vin_src  0  DC 0  AC 1
+Rs_p   vin_src  inp  50
+* Negative path terminated to GND (single-ended drive)
+Vinn_tb  inn  0  DC 0
+
+* Channel instance
+X_CH  inp  inn  outp  outn  0  channel_model
+
+* RX termination loads (50 Ω each side to GND)
+Rload_p  outp  0  50
+Rload_n  outn  0  50
+
+.AC DEC 100 1Meg 50Gig
+
+.PRINT AC vdb(outp) vp(outp)
+
+.END

@@ -1,0 +1,49 @@
+* TX On-Chip Termination
+* =======================
+* Subcircuit: tx_termination
+* Ports: outp outn vdd
+*
+* Two 50 Ω resistors from VDD to each TX output node.
+* Provides both the CML differential load and source impedance matching
+* to the 50 Ω channel characteristic impedance — eliminates TX-end reflections.
+*
+* Combined with tx_driver_cml (I_tail = 4 mA):
+*   V_CM_out  = VDD − (I_tail/2) × 50 Ω = 1.8 − 0.10 = 1.70 V
+*   ΔV/side   = I_tail × 50 Ω = 200 mV  (one transistor fully on)
+*   V_diff_pp = 400 mVppd
+*
+* Reference: Palermo, ECEN720 Lecture 5 — "TX Driver & Termination",
+*            Texas A&M University
+* Compatible: ngspice 38+
+
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.45 KP=200u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+
+* ── Subcircuit ──────────────────────────────────────────────────────────────
+.SUBCKT tx_termination  outp  outn  vdd
+* 50 Ω source-termination resistors (VDD pull-ups = CML load)
+Rterm_p  vdd  outp  50
+Rterm_n  vdd  outn  50
+.ENDS tx_termination
+
+* ── Standalone Testbench ─────────────────────────────────────────────────────
+* Run: ngspice tx_termination.cir
+*
+* Mocks the TX driver with current sources to verify DC operating point.
+* I_mock_p sinks 4 mA (M1 fully on); I_mock_n sinks 0 mA (M2 cut off).
+* Expect: v(outp) ≈ 1.6 V   (VDD − 4 mA × 50 Ω)
+*         v(outn) ≈ 1.8 V   (0 mA through Rterm_n)
+*         Differential      ≈ −200 mV (single-cycle, half the ppd swing)
+
+VDD  vdd  0  DC 1.8
+
+* Mock TX driver: current sources model one transistor fully on
+I_mock_p  outp  0  DC 4m
+I_mock_n  outn  0  DC 0
+
+X_TRM  outp  outn  vdd  tx_termination
+
+.OP
+
+.PRINT OP v(outp) v(outn) v(outp,outn)
+
+.END

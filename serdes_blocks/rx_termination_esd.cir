@@ -1,0 +1,84 @@
+* RX Termination + ESD Protection
+* ==================================
+* Subcircuit: rx_termination_esd
+* Ports: inp inn rxp rxn vdd vtt gnd
+*
+* Full RX front-end network covering:
+*   1. AC coupling capacitors  — block TX common-mode, allow independent RX CM
+*   2. Common-mode bias        — Rbias sets AC-coupled CM to VTT (= VDD/2 = 0.9 V)
+*   3. Differential termination — 100 Ω across RXP/RXN (50 Ω single-ended equiv.)
+*   4. ESD diodes              — clamp each pad to [GND−0.7V, VDD+0.7V]
+*
+* AC coupling high-pass cutoff:
+*   f_hp ≈ 1/(2π × (Rsrc + Rbias_eff) × Cac)
+*   With Rsrc = 50 Ω, Rterm = 100 Ω → Rbias_eff ≈ 50 Ω parallel 100 Ω ≈ 33 Ω,
+*   Cac = 1 pF → f_hp ≈ 1/(2π × 33 × 1p) ≈ 4.8 GHz
+*   (Enlarge Cac to 100 pF for off-chip cap: f_hp drops to 48 MHz, typical production)
+*
+* ESD diode model DIO_ESD:
+*   Forward clamp ≈ 0.6–0.7 V;  Reverse breakdown BV = 5.5 V
+*   CJO = 50 fF keeps parasitic capacitance low at signal frequencies
+*
+* Reference: Palermo, ECEN689 Lecture 18; Palermo, ECEN474 Lecture 25,
+*            Texas A&M University
+* Compatible: ngspice 38+
+
+.MODEL DIO_ESD D (IS=1e-14 RS=5 N=1.1 CJO=50f BV=5.5 IBV=1u)
+
+* ── Subcircuit ──────────────────────────────────────────────────────────────
+.SUBCKT rx_termination_esd  inp  inn  rxp  rxn  vdd  vtt  gnd
+
+* AC coupling: 1 pF capacitors isolate TX DC level from RX CM bias
+Cac_p  inp  acp  1p
+Cac_n  inn  acn  1p
+
+* CM bias: high-resistance path to VTT sets RX common-mode
+Rbias_p  acp  vtt  10k
+Rbias_n  acn  vtt  10k
+
+* Differential termination: 100 Ω across the pair = 50 Ω single-ended
+Rterm  acp  acn  100
+
+* ESD protection diodes on each pad
+* D_p_hi: clamp acp ≤ VDD + 0.7 V  (forward when V_acp > VDD)
+* D_p_lo: clamp acp ≥ GND − 0.7 V  (forward when V_acp < GND)
+D_p_hi  acp  vdd  DIO_ESD
+D_p_lo  gnd  acp  DIO_ESD
+D_n_hi  acn  vdd  DIO_ESD
+D_n_lo  gnd  acn  DIO_ESD
+
+* Output wires to CTLE inputs (zero-resistance connection)
+Rout_p  acp  rxp  0.01
+Rout_n  acn  rxn  0.01
+
+.ENDS rx_termination_esd
+
+* ── Standalone Testbench ─────────────────────────────────────────────────────
+* Run: ngspice rx_termination_esd.cir
+*
+* Part A (AC): Drives inp with a 50 Ω source; measures high-pass shape.
+*   Expect: vdb(rxp) rises from low (DC blocked) to 0 dB at high frequency.
+*
+* Part B (TRAN): Applies ±3 V spike on inp to verify ESD clamping.
+*   Expect: v(rxp) clamped to [−0.7 V, 2.5 V] (VDD+0.7V = 1.8+0.7 = 2.5V).
+
+VDD  vdd  0  DC 1.8
+VTT  vtt  0  DC 0.9
+
+* 50 Ω Thevenin source for AC test
+Vsrc  vin_src  0  DC 0  AC 1
+Rs_p  vin_src  inp  50
+* Negative input fixed at CM for single-ended AC drive
+Vinn_bias  inn  0  DC 0.9
+
+X_RXT  inp  inn  rxp  rxn  vdd  vtt  0  rx_termination_esd
+
+* Open-circuit output (CTLE not yet connected); small cap models CTLE input
+Cload_p  rxp  0  100f
+Cload_n  rxn  0  100f
+
+.AC DEC 100 1Meg 50Gig
+
+.PRINT AC vdb(rxp) vp(rxp)
+
+.END
