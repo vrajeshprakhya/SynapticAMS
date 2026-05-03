@@ -1,0 +1,16 @@
+* Test OSDI DC Sweep
+V_tx_in_p tx_in_p 0 DC 0
+R_load tx_tail 0 1meg
+
+.model osdi_model tx_tail_vs_tx_in_p
+
+Nmodel tx_in_p tx_tail osdi_model
+
+.control
+pre_osdi /home/vrajeshprakhya/SynapticAMS/my_demo_results/nonai/tx_tail_vs_tx_in_p.osdi
+dc V_tx_in_p 0 1.8 0.3
+print tx_tail
+quit
+.endc
+
+.end

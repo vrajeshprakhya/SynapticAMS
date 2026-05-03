@@ -1,0 +1,32 @@
+* Test to see what vectors are available after DC sweep
+
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.45 KP=200u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+
+VDD   vdd  0  DC 1.8
+Vsrc_p  tx_p_src  0  DC 0.9
+Vsrc_n  tx_n_src  0  DC 0.9
+
+Rs_p  tx_p_src  ctle_outp  1k
+Rs_n  tx_n_src  ctle_outn  1k
+Rload_p  ctle_outp  0  1k
+Rload_n  ctle_outn  0  1k
+
+.dc Vsrc_p 0 1 0.5 Vsrc_n 0 1 0.5
+
+.control
+run
+echo "Available vectors:"
+display
+echo ""
+echo "Trying to print tx_p_src:"
+print tx_p_src
+echo ""
+echo "Trying to print v(tx_p_src):"
+print v(tx_p_src)
+echo ""
+echo "Trying to print vsrc_p:"
+print vsrc_p
+quit
+.endc
+
+.end

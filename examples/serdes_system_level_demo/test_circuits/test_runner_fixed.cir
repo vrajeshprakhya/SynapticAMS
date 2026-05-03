@@ -1,0 +1,14 @@
+* OSDI test runner
+* This file loads the OSDI model, then sources the netlist
+
+.title OSDI runner
+
+.control
+osdi /tmp/test_model.osdi
+source /tmp/test_netlist_fixed.sp
+run
+print v(vd) v(vd_model)
+quit
+.endc
+
+.END

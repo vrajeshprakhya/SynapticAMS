@@ -1,0 +1,10 @@
+* Test Saved Nodes Only
+.include /tmp/flattened_serdes.cir
+
+.CONTROL
+tran 10p 5n
+wrdata /tmp/saved_nodes.txt v(tx_p) v(ch_out_p) v(ctle_outp) v(vga_out) v(final_out)
+quit
+.ENDC
+
+.END

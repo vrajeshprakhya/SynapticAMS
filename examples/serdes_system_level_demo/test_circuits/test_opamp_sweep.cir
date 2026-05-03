@@ -1,0 +1,29 @@
+* Test DC sweep with op-amp feedback (VGA circuit)
+
+* Ideal op-amp subcircuit
+.subckt OPAMP in_p in_n out
+E1 out 0 in_p in_n 100k
+.ends OPAMP
+
+* VGA circuit
+Vin tx_p_src 0 DC 0.5
+Rin tx_p_src vg 10k
+Rbias vg 0 1Meg
+
+* Op-amp 
+X_OP 0 vg vout OPAMP
+
+* Feedback
+R0 vout vg 10k
+
+* DC sweep
+.dc Vin 0 1 0.1
+
+.control
+run
+set wr_singlescale
+wrdata /tmp/opamp_sweep.dat vout
+print v(tx_p_src) v(vout) v(vg)
+.endc
+
+.end

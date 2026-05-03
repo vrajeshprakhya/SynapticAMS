@@ -1,0 +1,10 @@
+* Test Final Output
+.include /tmp/flattened_serdes.cir
+
+.CONTROL
+tran 10p 2n
+wrdata /tmp/final_out.txt v(tx_p) v(final_out)
+quit
+.ENDC
+
+.END

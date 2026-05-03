@@ -1,0 +1,14 @@
+* Test Transient Signal Chain
+.include /tmp/flattened_serdes.cir
+
+.CONTROL
+* Run transient analysis
+tran 10p 5n
+
+* Print key nodes at a few time points
+print v(tx_p_src) v(tx_n_src) v(ch_out_p) v(ch_out_n) v(ctle_inp) v(ctle_inn) v(ctle_outp) v(ctle_outn) v(vga_out) v(final_out)
+
+quit
+.ENDC
+
+.END

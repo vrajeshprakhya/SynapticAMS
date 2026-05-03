@@ -1,0 +1,13 @@
+* Test OSDI model loading
+
+.title OSDI load test
+
+.control
+echo "Loading OSDI model..."
+osdi /tmp/test_model.osdi
+echo "Listing models..."
+listmod
+quit
+.endc
+
+.END

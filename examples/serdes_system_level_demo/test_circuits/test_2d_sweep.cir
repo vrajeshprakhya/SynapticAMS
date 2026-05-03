@@ -1,0 +1,28 @@
+* Test 2D sweep deck
+* From flattened SerDes - simplified
+
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.45 KP=200u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+
+* Power supply
+VDD   vdd  0  DC 1.8
+
+* Sources to sweep
+Vsrc_p  tx_p_src  0  DC 0.9
+Vsrc_n  tx_n_src  0  DC 0.9
+
+* Simple resistor divider for testing
+Rs_p  tx_p_src  ctle_outp  1k
+Rs_n  tx_n_src  ctle_outn  1k
+Rload_p  ctle_outp  0  1k
+Rload_n  ctle_outn  0  1k
+
+* 2D DC sweep
+.dc Vsrc_p 0 1 0.2 Vsrc_n 0 1 0.2
+
+.control
+run
+print tx_p_src tx_n_src ctle_outp ctle_outn
+quit
+.endc
+
+.end

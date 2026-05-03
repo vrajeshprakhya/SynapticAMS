@@ -1,0 +1,16 @@
+* Test Fixed Netlist
+.include /tmp/flattened_serdes.cir
+
+.CONTROL
+* Run short transient
+tran 10p 2n
+
+* Write results to file
+set wr_singlescale
+set wr_vecnames
+wrdata /tmp/fixed_results.txt v(tx_p) v(ch_out_p) v(ctle_inp) v(ctle_outp) v(vga_out) v(final_out)
+
+quit
+.ENDC
+
+.END

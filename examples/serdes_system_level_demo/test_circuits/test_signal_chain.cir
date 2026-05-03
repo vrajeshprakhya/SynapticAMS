@@ -1,0 +1,12 @@
+* Test Signal Chain
+* Include the full integrated SerDes circuit
+.include /tmp/flattened_serdes.cir
+
+* Override control section to print intermediate node values
+.CONTROL
+tran 10p 5n
+print v(tx_p_src) v(tx_n_src) v(ch_out_p) v(ch_out_n) v(ctle_inp) v(ctle_inn) v(ctle_outp) v(ctle_outn) v(vga_out) v(final_out) > /tmp/signal_chain_debug.txt
+quit
+.ENDC
+
+.END

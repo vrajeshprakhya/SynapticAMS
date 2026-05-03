@@ -1,0 +1,26 @@
+* Test DC sweep on flattened netlist
+* Only include the relevant parts to test
+
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.45 KP=200u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+
+* Power supply
+VDD   vdd  0  DC 1.8
+
+* Source to sweep
+Vsrc_p  tx_p_src  0  DC 0.9  
+
+* Simple load
+Rs_p  tx_p_src  node1  50
+Rload node1 0 1k
+
+* DC sweep
+.dc Vsrc_p 0 1 0.05
+
+.control
+run
+set wr_singlescale
+wrdata /tmp/sweep_test.dat node1
+print v(tx_p_src) v(node1)
+.endc
+
+.end

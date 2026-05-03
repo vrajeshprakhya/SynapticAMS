@@ -1,0 +1,17 @@
+* Test wrdata with non-existent node
+
+Vin in 0 DC 0
+R1 in out 1k
+R2 out 0 1k
+
+.dc Vin 0 1 0.1
+
+.control
+run
+set wr_singlescale
+* Try to write a node that doesn't exist
+wrdata /tmp/bad_node.dat nonexistent_node
+print v(in) v(out)
+.endc
+
+.end

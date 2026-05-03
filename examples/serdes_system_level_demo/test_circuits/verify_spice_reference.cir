@@ -1,0 +1,25 @@
+* Verify SPICE Reference for Validation
+.include /tmp/flattened_serdes.cir
+
+.CONTROL
+* Run transient for 5ns @ 10ps steps
+tran 10p 5n
+
+* Print some sample values to verify signal is varying
+echo ""
+echo "=== SPICE Reference Verification ==="
+echo "Sample output values (should be varying):"
+print v(final_out)[100]
+print v(final_out)[200]
+print v(final_out)[300]
+print v(final_out)[400]
+print v(final_out)[500]
+echo ""
+
+* Write full results
+wrdata /tmp/spice_reference.txt v(final_out)
+
+quit
+.ENDC
+
+.END

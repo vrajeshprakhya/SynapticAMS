@@ -1,0 +1,10 @@
+* List Available Nodes
+.include /tmp/flattened_serdes.cir
+
+.CONTROL
+op
+display
+quit
+.ENDC
+
+.END

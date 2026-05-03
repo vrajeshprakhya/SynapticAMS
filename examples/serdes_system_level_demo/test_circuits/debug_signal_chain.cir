@@ -1,0 +1,22 @@
+* Debug Signal Chain Test
+.include /tmp/flattened_serdes.cir
+
+* Input signals (differential 1GHz sine waves)
+Vsrc_p tx_p_src 0 DC 0.9 SIN(0.9 0.1 1G)
+Vsrc_n tx_n_src 0 DC 0.9 SIN(0.9 -0.1 1G 0 0 180)
+
+.tran 10p 5n
+
+.control
+run
+* Print all critical nodes in the signal chain
+print v(tx_p_src) v(tx_n_src) > /tmp/debug_inputs.txt
+print v(ch_out_p) v(ch_out_n) > /tmp/debug_channel.txt
+print v(ctle_inp) v(ctle_inn) > /tmp/debug_ctle_in.txt
+print v(ctle_outp) v(ctle_outn) > /tmp/debug_ctle_out.txt
+print v(vga_out) > /tmp/debug_vga.txt
+print v(final_out) > /tmp/debug_final.txt
+quit
+.endc
+
+.end

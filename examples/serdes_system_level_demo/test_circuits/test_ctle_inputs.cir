@@ -1,0 +1,10 @@
+* Test CTLE Inputs
+.include /tmp/flattened_serdes.cir
+
+.CONTROL
+tran 10p 100n
+wrdata /tmp/ctle_debug.txt v(tx_p) v(ch_out_p) v(ctle_inp) v(ctle_outp) v(final_out)
+quit
+.ENDC
+
+.END

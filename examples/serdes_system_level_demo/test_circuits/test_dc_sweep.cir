@@ -1,0 +1,16 @@
+* Test DC sweep - diagnose why pipeline DC sweep fails
+* This is what the pipeline is trying to do
+
+Vsrc_p  tx_p_src  0  DC 0.9  AC 1  SIN(0.9 0.1 1G)
+Rs_p  tx_p_src  tx_p  50
+Rload_p  tx_p  0  1k
+
+.dc Vsrc_p 0 1.8 0.1
+
+.control
+run
+print v(tx_p_src) v(tx_p)
+wrdata /tmp/test_sweep.dat v(tx_p_src) v(tx_p)
+.endc
+
+.end

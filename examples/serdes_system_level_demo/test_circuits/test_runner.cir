@@ -1,0 +1,8 @@
+.control
+pre_osdi /tmp/test_model.osdi
+source /tmp/test_main.sp
+run
+print v(vd) v(vd_model)
+quit
+.endc
+.end

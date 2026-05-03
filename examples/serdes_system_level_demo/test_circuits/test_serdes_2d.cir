@@ -1,0 +1,49 @@
+* Test 2D sweep on simplified SerDes
+* Just the CTLE section
+
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.45 KP=200u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+
+* Power supply
+VDD   vdd  0  DC 1.8
+
+* Sources to sweep
+Vsrc_p  tx_p_src  0  DC 0.9
+Vsrc_n  tx_n_src  0  DC 0.9
+
+* Connect to CTLE inputs through bias resistors
+Rbias_p  tx_p_src  ctle_inp  1k
+Rbias_n  tx_n_src  ctle_inn  1k
+Vcm_p    ctle_inp  0  DC 0.9
+Vcm_n    ctle_inn  0  DC 0.9
+
+* CTLE differential pair
+M_X_CTLE_1 ctle_outp ctle_inp X_CTLE_s1 0 NMOS W=20u L=0.18u
+M_X_CTLE_2 ctle_outn ctle_inn X_CTLE_s2 0 NMOS W=20u L=0.18u
+
+* Drain load resistors
+R_X_CTLE_D1 vdd ctle_outp 500
+R_X_CTLE_D2 vdd ctle_outn 500
+
+* RC source degeneration
+R_X_CTLE_S1 X_CTLE_s1 X_CTLE_tail 200
+C_X_CTLE_S1 X_CTLE_s1 X_CTLE_tail 800f
+R_X_CTLE_S2 X_CTLE_s2 X_CTLE_tail 200
+C_X_CTLE_S2 X_CTLE_s2 X_CTLE_tail 800f
+
+* Tail current source
+I_X_CTLE__tail X_CTLE_tail 0 DC 2m
+
+* Load capacitors
+Cout_p  ctle_outp  0  100f
+Cout_n  ctle_outn  0  100f
+
+* 2D DC sweep
+.dc Vsrc_p 0 1.8 0.2 Vsrc_n 0 1.8 0.2
+
+.control
+run
+print tx_p_src tx_n_src ctle_outp ctle_outn X_CTLE_s1 X_CTLE_s2
+quit
+.endc
+
+.end
