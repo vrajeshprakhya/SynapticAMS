@@ -1,0 +1,96 @@
+`include "disciplines.vams"
+
+module serdes_rx_system(
+    output electrical final_out,
+    input electrical tx_p_src,
+    input electrical tx_n_src
+);
+
+    parameter real vdd = 1.8;
+    parameter real vth = 0.45;
+    parameter real output_resistance = 50.0;
+    
+    // Channel parameters (30" FR4 trace)
+    parameter real channel_loss_1ghz = 0.8;
+    parameter real channel_loss_5ghz = 0.18;
+    parameter real channel_delay = 2.5e-9;
+    
+    // CTLE parameters
+    parameter real ctle_peak_gain_db = 7.3;
+    parameter real ctle_peak_freq = 3.5e9;
+    parameter real ctle_zero_freq = 1.0e9;
+    parameter real ctle_dc_gain = 1.0;
+    
+    // VGA parameters
+    parameter real vga_gain_high = 10.0;
+    parameter real vga_gain_low = 1.0;
+    
+    // Summer parameters
+    parameter real summer_gain = 1.0;
+
+    analog begin : analog_block
+        real v_diff, v_cm;
+        // REMOVED (declaration in analog block): real v_channel_out;
+        // REMOVED (declaration in analog block): real v_ctle_out;
+        // REMOVED (declaration in analog block): real v_vga_out;
+        // REMOVED (declaration in analog block): real v_final;
+        // REMOVED (declaration in analog block): real freq_response;
+        real channel_tf, ctle_tf, vga_gain;
+        real s_norm, omega_norm;
+        
+        // Differential and common mode calculation
+        v_diff = V(tx_p_src) - V(tx_n_src);
+        v_cm = (V(tx_p_src) + V(tx_n_src)) * 0.5;
+        
+        // Channel modeling (frequency-dependent loss approximation)
+        // Simple first-order approximation for FR4 loss
+        v_channel_out = v_diff * channel_loss_1ghz;
+        
+        // Add common mode bias shift (channel couples some CM to DM)
+        v_channel_out = v_channel_out + (v_cm - 0.9) * 0.1;
+        
+        // CTLE modeling (peaking equalizer)
+        // Simplified transfer function: gain peaking at high frequency
+        // H(s) ≈ (1 + s/ωz) / (1 + s/ωp) where ωp > ωz
+        ctle_tf = ctle_dc_gain;
+        if (abs(v_channel_out) > 1e-6) begin
+            // Approximate peaking behavior
+            freq_response = 1.0 + (ctle_peak_gain_db/20.0) * log10(1.0 + abs(v_channel_out) * 1e9);
+            ctle_tf = ctle_tf * pow(10.0, freq_response/20.0);
+        end
+        v_ctle_out = v_channel_out * ctle_tf;
+        
+        // Clamp CTLE output to reasonable range
+        if (v_ctle_out > vdd - 0.2) v_ctle_out = vdd - 0.2;
+        if (v_ctle_out < 0.2) v_ctle_out = 0.2;
+        
+        // VGA modeling (variable gain based on signal amplitude)
+        // Simplified AGC: higher gain for smaller signals
+        if (abs(v_ctle_out) < 0.1)
+            vga_gain = vga_gain_high;
+        else
+            vga_gain = vga_gain_low + (vga_gain_high - vga_gain_low) * exp(-abs(v_ctle_out) * 5.0);
+            
+        v_vga_out = v_ctle_out * vga_gain;
+        
+        // Clamp VGA output
+        if (v_vga_out > vdd - 0.1) v_vga_out = vdd - 0.1;
+        if (v_vga_out < 0.1) v_vga_out = 0.1;
+        
+        // Summer (includes DFE feedback - simplified as DC offset correction)
+        v_final = v_vga_out * summer_gain;
+        
+        // Add realistic DC bias (around mid-rail)
+        v_final = v_final + 0.9;
+        
+        // Final output limiting
+        if (v_final > vdd) v_final = vdd;
+        if (v_final < 0.0) v_final = 0.0;
+        
+        // Add small signal nonlinearity for realism
+        v_final = v_final + 0.001 * sin(v_final * 10.0);
+        
+        // Output with proper impedance
+        I(final_out) <+ (v_final - V(final_out)) / output_resistance;
+    end
+endmodule

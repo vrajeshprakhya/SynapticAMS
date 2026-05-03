@@ -1,0 +1,16 @@
+* Test original SPICE SerDes
+.include /tmp/flattened_serdes.cir
+
+* Input signals
+Vsrc_p tx_p_src 0 DC 0.9 SIN(0.9 0.1 1G)
+Vsrc_n tx_n_src 0 DC 0.9 SIN(0.9 -0.1 1G 0 0 180)
+
+.tran 10p 2n
+
+.control
+run
+print v(final_out) > spice_out.txt
+quit
+.endc
+
+.end

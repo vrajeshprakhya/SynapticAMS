@@ -1,0 +1,321 @@
+* ============================================================
+* SerDes RX Front-End — Integrated Chain
+* ============================================================
+* Signal flow: TX → Channel → CTLE → VGA → Summer → Output
+*
+* Blocks:
+*   1. Channel      - 30" FR4 PCB trace (differential, RLC ladder)
+*   2. CTLE         - Continuous-Time Linear Equalizer (peaking @ high freq)
+*   3. VGA          - Variable Gain Amplifier (controlled gain)
+*   4. Summer       - Analog adder (combines VGA + DFE feedback)
+*
+* Created: 2026-05-02
+* Purpose: Demonstrate full RX chain integration and verification
+* ============================================================
+
+* ── Model Definitions ──────────────────────────────────────────────────────
+.MODEL NMOS NMOS (LEVEL=1 VTO=0.45 KP=200u LAMBDA=0.02 GAMMA=0.4 PHI=0.65)
+.MODEL SMOD SW (Ron=10 Roff=1G Vt=0.5 Vh=0.1)
+
+* ── OPAMP Subcircuit (for VGA and Summer) ──────────────────────────────────
+
+* ── Switch Subcircuit (for VGA gain control) ───────────────────────────────
+
+* ── BLOCK 1: Channel Model ─────────────────────────────────────────────────
+* 30" FR4 PCB differential trace with SMA connectors
+* Expected: -3 dB @ 300 MHz, -15 dB @ 5 GHz
+
+* ── BLOCK 2: CTLE ──────────────────────────────────────────────────────────
+* Degenerated NMOS differential pair with RC source degeneration
+* Peaking: 7.3 dB @ ~3-5 GHz, zero @ 1 GHz
+
+* ── BLOCK 3: VGA ───────────────────────────────────────────────────────────
+* Variable gain amplifier with switched feedback
+* Gain controlled by switch s0 (1 = on, 0 = off)
+
+* ── BLOCK 4: Summer ────────────────────────────────────────────────────────
+* Analog adder: combines VGA output + DFE feedback
+
+* ══════════════════════════════════════════════════════════════════════════
+* INTEGRATED TESTBENCH
+* ══════════════════════════════════════════════════════════════════════════
+
+* ── Power Supplies ─────────────────────────────────────────────────────────
+VDD   vdd  0  DC 1.8
+
+* ── TX Signal Source (Differential) ────────────────────────────────────────
+* 1 GHz differential sinusoid (10 Gbps data rate approximation)
+* Amplitude: 200 mV differential (100 mV single-ended)
+Vsrc_p  tx_p_src  0  DC 0.9  AC 1  SIN(0.9 0.1 1G)
+Vsrc_n  tx_n_src  0  DC 0.9  AC 1  SIN(0.9 -0.1 1G)
+
+* TX output impedance (50 Ω per side)
+Rs_p  tx_p_src  tx_p  50
+Rs_n  tx_n_src  tx_n  50
+
+* ── BLOCK 1: Channel ───────────────────────────────────────────────────────
+* --- begin flattened instance: X_CHANNEL (CHANNEL_MODEL)
+
+* TX-side SMA Connector (Positive Path)
+R_X_CHANNEL_cx1p tx_p X_CHANNEL_cx1p 2
+L_X_CHANNEL_cx1p X_CHANNEL_cx1p X_CHANNEL_cx2p 1n
+C_X_CHANNEL_cx1p X_CHANNEL_cx2p 0 0.5p
+
+* TX-side SMA Connector (Negative Path)
+R_X_CHANNEL_cx1n tx_n X_CHANNEL_cx1n 2
+L_X_CHANNEL_cx1n X_CHANNEL_cx1n X_CHANNEL_cx2n 1n
+C_X_CHANNEL_cx1n X_CHANNEL_cx2n 0 0.5p
+
+* 10-Section RLC Ladder — Positive Path
+R_X_CHANNEL_1p X_CHANNEL_cx2p X_CHANNEL_s1p 0.76
+L_X_CHANNEL_1p X_CHANNEL_s1p X_CHANNEL_p01 26.1n
+C_X_CHANNEL_1p X_CHANNEL_p01 0 10.4p
+
+R_X_CHANNEL_2p X_CHANNEL_p01 X_CHANNEL_s2p 0.76
+L_X_CHANNEL_2p X_CHANNEL_s2p X_CHANNEL_p02 26.1n
+C_X_CHANNEL_2p X_CHANNEL_p02 0 10.4p
+
+R_X_CHANNEL_3p X_CHANNEL_p02 X_CHANNEL_s3p 0.76
+L_X_CHANNEL_3p X_CHANNEL_s3p X_CHANNEL_p03 26.1n
+C_X_CHANNEL_3p X_CHANNEL_p03 0 10.4p
+
+R_X_CHANNEL_4p X_CHANNEL_p03 X_CHANNEL_s4p 0.76
+L_X_CHANNEL_4p X_CHANNEL_s4p X_CHANNEL_p04 26.1n
+C_X_CHANNEL_4p X_CHANNEL_p04 0 10.4p
+
+R_X_CHANNEL_5p X_CHANNEL_p04 X_CHANNEL_s5p 0.76
+L_X_CHANNEL_5p X_CHANNEL_s5p X_CHANNEL_p05 26.1n
+C_X_CHANNEL_5p X_CHANNEL_p05 0 10.4p
+
+R_X_CHANNEL_6p X_CHANNEL_p05 X_CHANNEL_s6p 0.76
+L_X_CHANNEL_6p X_CHANNEL_s6p X_CHANNEL_p06 26.1n
+C_X_CHANNEL_6p X_CHANNEL_p06 0 10.4p
+
+R_X_CHANNEL_7p X_CHANNEL_p06 X_CHANNEL_s7p 0.76
+L_X_CHANNEL_7p X_CHANNEL_s7p X_CHANNEL_p07 26.1n
+C_X_CHANNEL_7p X_CHANNEL_p07 0 10.4p
+
+R_X_CHANNEL_8p X_CHANNEL_p07 X_CHANNEL_s8p 0.76
+L_X_CHANNEL_8p X_CHANNEL_s8p X_CHANNEL_p08 26.1n
+C_X_CHANNEL_8p X_CHANNEL_p08 0 10.4p
+
+R_X_CHANNEL_9p X_CHANNEL_p08 X_CHANNEL_s9p 0.76
+L_X_CHANNEL_9p X_CHANNEL_s9p X_CHANNEL_p09 26.1n
+C_X_CHANNEL_9p X_CHANNEL_p09 0 10.4p
+
+R_X_CHANNEL_10p X_CHANNEL_p09 X_CHANNEL_s10p 0.76
+L_X_CHANNEL_10p X_CHANNEL_s10p X_CHANNEL_p10 26.1n
+C_X_CHANNEL_10p X_CHANNEL_p10 0 10.4p
+
+* 10-Section RLC Ladder — Negative Path
+R_X_CHANNEL_1n X_CHANNEL_cx2n X_CHANNEL_s1n 0.76
+L_X_CHANNEL_1n X_CHANNEL_s1n X_CHANNEL_n01 26.1n
+C_X_CHANNEL_1n X_CHANNEL_n01 0 10.4p
+
+R_X_CHANNEL_2n X_CHANNEL_n01 X_CHANNEL_s2n 0.76
+L_X_CHANNEL_2n X_CHANNEL_s2n X_CHANNEL_n02 26.1n
+C_X_CHANNEL_2n X_CHANNEL_n02 0 10.4p
+
+R_X_CHANNEL_3n X_CHANNEL_n02 X_CHANNEL_s3n 0.76
+L_X_CHANNEL_3n X_CHANNEL_s3n X_CHANNEL_n03 26.1n
+C_X_CHANNEL_3n X_CHANNEL_n03 0 10.4p
+
+R_X_CHANNEL_4n X_CHANNEL_n03 X_CHANNEL_s4n 0.76
+L_X_CHANNEL_4n X_CHANNEL_s4n X_CHANNEL_n04 26.1n
+C_X_CHANNEL_4n X_CHANNEL_n04 0 10.4p
+
+R_X_CHANNEL_5n X_CHANNEL_n04 X_CHANNEL_s5n 0.76
+L_X_CHANNEL_5n X_CHANNEL_s5n X_CHANNEL_n05 26.1n
+C_X_CHANNEL_5n X_CHANNEL_n05 0 10.4p
+
+R_X_CHANNEL_6n X_CHANNEL_n05 X_CHANNEL_s6n 0.76
+L_X_CHANNEL_6n X_CHANNEL_s6n X_CHANNEL_n06 26.1n
+C_X_CHANNEL_6n X_CHANNEL_n06 0 10.4p
+
+R_X_CHANNEL_7n X_CHANNEL_n06 X_CHANNEL_s7n 0.76
+L_X_CHANNEL_7n X_CHANNEL_s7n X_CHANNEL_n07 26.1n
+C_X_CHANNEL_7n X_CHANNEL_n07 0 10.4p
+
+R_X_CHANNEL_8n X_CHANNEL_n07 X_CHANNEL_s8n 0.76
+L_X_CHANNEL_8n X_CHANNEL_s8n X_CHANNEL_n08 26.1n
+C_X_CHANNEL_8n X_CHANNEL_n08 0 10.4p
+
+R_X_CHANNEL_9n X_CHANNEL_n08 X_CHANNEL_s9n 0.76
+L_X_CHANNEL_9n X_CHANNEL_s9n X_CHANNEL_n09 26.1n
+C_X_CHANNEL_9n X_CHANNEL_n09 0 10.4p
+
+R_X_CHANNEL_10n X_CHANNEL_n09 X_CHANNEL_s10n 0.76
+L_X_CHANNEL_10n X_CHANNEL_s10n X_CHANNEL_n10 26.1n
+C_X_CHANNEL_10n X_CHANNEL_n10 0 10.4p
+
+* RX-side SMA Connector (Positive Path)
+R_X_CHANNEL_cx2p X_CHANNEL_p10 X_CHANNEL_cx3p 2
+L_X_CHANNEL_cx2p X_CHANNEL_cx3p ch_out_p 1n
+C_X_CHANNEL_cx2p ch_out_p 0 0.5p
+
+* RX-side SMA Connector (Negative Path)
+R_X_CHANNEL_cx2n X_CHANNEL_n10 X_CHANNEL_cx3n 2
+L_X_CHANNEL_cx2n X_CHANNEL_cx3n ch_out_n 1n
+C_X_CHANNEL_cx2n ch_out_n 0 0.5p
+
+* --- end flattened instance: X_CHANNEL
+
+* ── BLOCK 2: CTLE ──────────────────────────────────────────────────────────
+* Direct DC coupling from channel to CTLE
+* Channel output already has correct DC bias (~0.9V differential)
+* Use 0Ω connection (direct wire)
+Rconn_p  ch_out_p  ctle_inp  0
+Rconn_n  ch_out_n  ctle_inn  0
+
+* --- begin flattened instance: X_CTLE (CTLE)
+
+* Differential pair
+M_X_CTLE_1 ctle_outp ctle_inp X_CTLE_s1 0 NMOS W=20u L=0.18u
+M_X_CTLE_2 ctle_outn ctle_inn X_CTLE_s2 0 NMOS W=20u L=0.18u
+
+* Drain load resistors
+R_X_CTLE_D1 vdd ctle_outp 500
+R_X_CTLE_D2 vdd ctle_outn 500
+
+* RC source degeneration (M1 path)
+R_X_CTLE_S1 X_CTLE_s1 X_CTLE_tail 200
+C_X_CTLE_S1 X_CTLE_s1 X_CTLE_tail 800f
+
+* RC source degeneration (M2 path)
+R_X_CTLE_S2 X_CTLE_s2 X_CTLE_tail 200
+C_X_CTLE_S2 X_CTLE_s2 X_CTLE_tail 800f
+
+* Tail current source
+I_X_CTLE__tail X_CTLE_tail 0 DC 2m
+
+* --- end flattened instance: X_CTLE
+
+* Load capacitors on CTLE output
+Cout_p  ctle_outp  0  100f
+Cout_n  ctle_outn  0  100f
+
+* ── BLOCK 3: VGA (Positive Path Only for Simplicity) ──────────────────────
+* Convert CTLE differential output to single-ended for VGA
+* Use resistor divider to center around 0V
+Rctle_p  ctle_outp  vga_in  10k
+Rctle_n  ctle_outn  0       10k
+
+* VGA gain control (1 = max gain)
+Vctrl_vga  s0  0  DC 1
+
+* --- begin flattened instance: X_VGA (VGA)
+
+* Virtual ground node (DC path)
+R_X_VGA_bias X_VGA_vg 0 1Meg
+
+* Op-amp (inverting)
+* --- begin flattened instance: X_VGA_XOP (OPAMP)
+E_X_VGA_XOP_1 vga_out 0 0 X_VGA_vg 100k
+* --- end flattened instance: X_VGA_XOP
+
+* Input resistor
+R_X_VGA_in vga_in X_VGA_vg 10k
+
+* Feedback path (switchable)
+* --- begin flattened instance: X_VGA_XSW (SW)
+S_X_VGA_XSW_1 X_VGA_vg X_VGA_n0 s0 0 SMOD
+* --- end flattened instance: X_VGA_XSW
+R_X_VGA_0 X_VGA_n0 vga_out 10k
+
+* --- end flattened instance: X_VGA
+
+* ── BLOCK 4: Summer ────────────────────────────────────────────────────────
+* Simplified DFE feedback (placeholder - just a DC offset for now)
+Vdfe_feedback  dfe_fb  0  DC 0
+
+* --- begin flattened instance: X_SUMMER (SUMMER)
+
+* Virtual ground node
+R_X_SUMMER_bias X_SUMMER_vref 0 1Meg
+
+* Op-amp
+* --- begin flattened instance: X_SUMMER_XOP (OPAMP)
+E_X_SUMMER_XOP_1 final_out 0 0 X_SUMMER_vref 100k
+* --- end flattened instance: X_SUMMER_XOP
+
+* Input resistors (equal weights for now)
+R_X_SUMMER_1 vga_out X_SUMMER_vref 10k
+R_X_SUMMER_2 dfe_fb X_SUMMER_vref 10k
+
+* Feedback resistor
+R_X_SUMMER_f final_out X_SUMMER_vref 10k
+
+* --- end flattened instance: X_SUMMER
+
+* ══════════════════════════════════════════════════════════════════════════
+* SIMULATION COMMANDS
+* ══════════════════════════════════════════════════════════════════════════
+
+* Transient analysis: 5 ns for 5 cycles @ 1 GHz
+.TRAN 10p 5n
+
+* AC analysis: frequency response
+.AC DEC 100 100Meg 20Gig
+
+* Operating point
+.OP
+
+* Save key nodes
+.SAVE V(tx_p) V(ch_out_p) V(ctle_outp) V(vga_out) V(final_out)
+
+* ══════════════════════════════════════════════════════════════════════════
+* CONTROL BLOCK
+* ══════════════════════════════════════════════════════════════════════════
+.CONTROL
+
+echo ""
+echo "========================================================================"
+echo "  SerDes RX Front-End — Integrated Simulation"
+echo "========================================================================"
+echo ""
+
+* Run operating point
+echo "Running DC operating point..."
+op
+echo ""
+echo "Key DC Bias Points:"
+echo "  VDD              = " vdd
+echo "  CTLE outp        = " ctle_outp
+echo "  CTLE outn        = " ctle_outn
+echo "  VGA output       = " vga_out
+echo "  Final output     = " final_out
+echo ""
+
+* Run transient
+echo "Running transient analysis (5 ns @ 1 GHz input)..."
+tran 10p 5n
+echo ""
+echo "Transient simulation complete!"
+echo ""
+
+* Run AC analysis
+echo "Running AC frequency response..."
+ac dec 100 100Meg 20Gig
+echo ""
+echo "AC simulation complete!"
+echo ""
+
+* Write results
+set wr_vecnames
+set wr_singlescale
+write serdes_rx_integrated.raw v(tx_p) v(ch_out_p) v(ctle_outp) v(vga_out) v(final_out)
+
+echo "========================================================================"
+echo "  Results saved to: serdes_rx_integrated.raw"
+echo "========================================================================"
+echo ""
+echo "To plot transient waveforms:"
+echo "  plot v(tx_p) v(ch_out_p) v(ctle_outp) v(vga_out) v(final_out)"
+echo ""
+echo "To plot AC frequency response:"
+echo "  plot vdb(final_out)"
+echo ""
+echo "========================================================================"
+echo ""
+
+.ENDC

@@ -1398,8 +1398,11 @@ quit
         Returns:
             Complete SPICE netlist ready to simulate
         """
-        # Inject test vector into netlist
-        modified_netlist = self._inject_test_vector(spice_netlist, inputs, vector)
+        # Clean netlist before injecting test vector
+        clean_netlist = self._clean_netlist_for_embedding(spice_netlist)
+
+        # Inject test vector into cleaned netlist
+        modified_netlist = self._inject_test_vector(clean_netlist, inputs, vector)
 
         # Clean output names
         outputs_clean = [out.replace('net:', '') for out in outputs]
@@ -1423,6 +1426,60 @@ quit
 """
         return testbench
 
+    def _clean_netlist_for_embedding(self, spice_netlist: str, sweep_nodes: List[str] = None) -> str:
+        """
+        Clean SPICE netlist for embedding in testbench.
+
+        Removes .CONTROL blocks, analysis directives (.TRAN, .AC, .DC), and .END
+        that would interfere with the testbench's own control structure.
+
+        Args:
+            spice_netlist: Raw SPICE netlist
+            sweep_nodes: List of node names that will be swept (remove sources connected to these)
+        """
+        lines = []
+        in_control_block = False
+        sweep_nodes = sweep_nodes or []
+
+        for line in spice_netlist.split('\n'):
+            line_upper = line.strip().upper()
+
+            # Track and skip .CONTROL blocks
+            if line_upper.startswith('.CONTROL'):
+                in_control_block = True
+                continue
+            if line_upper.startswith('.ENDC'):
+                in_control_block = False
+                continue
+            if in_control_block:
+                continue
+
+            # Skip analysis directives and .END (but NOT .ENDS - subcircuit end)
+            if (line_upper == '.END' or
+                line_upper.startswith('.TRAN ') or line_upper == '.TRAN' or
+                line_upper.startswith('.AC ') or line_upper == '.AC' or
+                line_upper.startswith('.DC ') or line_upper == '.DC' or
+                line_upper.startswith('.PRINT ') or line_upper.startswith('.PLOT ')):
+                continue
+
+            # Comment out voltage/current sources connected to sweep nodes
+            if sweep_nodes:
+                if line_upper.startswith('V') or line_upper.startswith('I'):
+                    # Parse source line: V<name> <node+> <node-> ...
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        node_plus = parts[1].lower()
+                        # Check if this source is connected to a sweep node
+                        for sweep_node in sweep_nodes:
+                            if node_plus == sweep_node.lower():
+                                # Comment out this line
+                                line = f"* {line}  (disabled for DC sweep)"
+                                break
+
+            lines.append(line)
+
+        return '\n'.join(lines)
+
     def _build_dc_sweep_testbench(self, spice_netlist: str, inputs: List[str],
                                    outputs: List[str], test_vectors: np.ndarray,
                                    block_info: Dict) -> str:
@@ -1437,6 +1494,9 @@ quit
         """
         outputs_clean = [out.replace('net:', '') for out in outputs]
         inputs_clean = [inp.replace('net:', '') for inp in inputs]
+
+        # Clean the netlist before embedding (remove sources on sweep nodes to avoid conflicts)
+        clean_netlist = self._clean_netlist_for_embedding(spice_netlist, sweep_nodes=inputs_clean)
 
         # Determine sweep parameters from test_vectors
         if len(inputs) == 1:
@@ -1473,20 +1533,44 @@ quit
             # 3D+: Not supported by DC sweep
             return "* DC sweep not supported for 3D+ inputs\n"
 
+        # Build dedicated sweep voltage sources
+        sweep_sources = []
+        if len(inputs) == 1:
+            sweep_var = inputs_clean[0]
+            sweep_sources.append(f"Vsweep_{sweep_var} {sweep_var} 0 DC 0")
+            dc_command = f".dc Vsweep_{sweep_var} {start} {stop} {step}"
+        elif len(inputs) == 2:
+            var1 = inputs_clean[0]
+            var2 = inputs_clean[1]
+            sweep_sources.append(f"Vsweep_{var1} {var1} 0 DC 0")
+            sweep_sources.append(f"Vsweep_{var2} {var2} 0 DC 0")
+            dc_command = f".dc Vsweep_{var1} {start1} {stop1} {step1} Vsweep_{var2} {start2} {stop2} {step2}"
+
+        sweep_sources_str = '\n'.join(sweep_sources)
+
+        # Use wrdata to save results to a file
+        import tempfile
+        output_file = tempfile.mktemp(suffix='.dat', prefix='dc_sweep_')
+
         # Build testbench
         testbench = f"""* Master DC Sweep Testbench for {block_info.get('name', 'block')}
 * Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 * Sweep: {len(inputs)}D grid ({len(test_vectors)} total points)
 * MUCH faster than individual point simulations!
 
-{spice_netlist}
+{clean_netlist}
+
+* Dedicated sweep voltage sources
+{sweep_sources_str}
 
 * DC sweep command (sweeps all test points in one simulation)
 {dc_command}
 
 .control
 run
-print {' '.join(outputs_clean)}
+set wr_singlescale
+set wr_vecnames
+wrdata {output_file} {' '.join(outputs_clean)}
 quit
 .endc
 

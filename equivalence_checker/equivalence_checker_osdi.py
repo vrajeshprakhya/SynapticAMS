@@ -96,7 +96,7 @@ class OSDIEquivalenceChecker(BaseChecker):
         return 'dc'
 
     def check_transient_equivalence(self, netlist, verilog_ams_code, module_name,
-                                   output_names=None, tstop=100e-9, tstep=1e-12):
+                                   input_names=None, output_names=None, tstop=100e-9, tstep=1e-12):
         """
         Check equivalence using transient simulation.
 
@@ -104,6 +104,7 @@ class OSDIEquivalenceChecker(BaseChecker):
             netlist: SPICE netlist text
             verilog_ams_code: Verilog-AMS module code
             module_name: Name of module
+            input_names: List of input signals (optional, extracted from Verilog-AMS if not provided)
             output_names: List of output signals to compare
             tstop: Simulation stop time (seconds)
             tstep: Time step (seconds)
@@ -112,12 +113,17 @@ class OSDIEquivalenceChecker(BaseChecker):
             EquivalenceResult
         """
         try:
+            # Extract input names from Verilog-AMS if not provided
+            if input_names is None:
+                input_names = self._extract_module_inputs(verilog_ams_code, module_name)
+
             # Compile Verilog-AMS to OSDI
             osdi_file = self._compile_to_osdi(verilog_ams_code, module_name)
 
             # Run transient simulation on both SPICE and OSDI
             spice_data = self._run_transient_spice(netlist, output_names, tstop, tstep)
-            osdi_data = self._run_transient_osdi(osdi_file, module_name, output_names, tstop, tstep)
+            osdi_data = self._run_transient_osdi(osdi_file, module_name, input_names, output_names,
+                                                  netlist, tstop, tstep)
 
             # Compare waveforms
             return self._compare_transient_waveforms(spice_data, osdi_data, output_names)
@@ -137,15 +143,29 @@ class OSDIEquivalenceChecker(BaseChecker):
     def _run_transient_spice(self, netlist, output_nodes, tstop, tstep):
         """Run transient simulation on original SPICE netlist."""
         with tempfile.NamedTemporaryFile(mode='w', suffix='.cir', delete=False) as f:
-            # Write netlist - remove existing .END, .TRAN, .PRINT directives
+            # Write netlist - remove existing .END, .TRAN, .PRINT, .AC, .DC directives and .CONTROL blocks
             lines = []
+            in_control_block = False
             for line in netlist.split('\n'):
                 line_upper = line.strip().upper()
+
+                # Track .CONTROL blocks to skip their content
+                if line_upper.startswith('.CONTROL'):
+                    in_control_block = True
+                    continue
+                if line_upper.startswith('.ENDC'):
+                    in_control_block = False
+                    continue
+                if in_control_block:
+                    continue
+
                 # Skip existing analysis and end directives
                 # BUT NOT .ENDS (subcircuit end)
                 if (line_upper == '.END' or
-                    line_upper.startswith('.TRAN ') or
-                    line_upper.startswith('.PRINT ')):
+                    line_upper.startswith('.TRAN ') or line_upper == '.TRAN' or
+                    line_upper.startswith('.AC ') or line_upper == '.AC' or
+                    line_upper.startswith('.DC ') or line_upper == '.DC' or
+                    line_upper.startswith('.PRINT ') or line_upper.startswith('.PLOT ')):
                     continue
                 lines.append(line)
 
@@ -185,17 +205,66 @@ class OSDIEquivalenceChecker(BaseChecker):
         finally:
             Path(deck_file).unlink(missing_ok=True)
 
-    def _run_transient_osdi(self, osdi_file, module_name, output_nodes, tstop, tstep):
-        """Run transient simulation on compiled OSDI model."""
+    def _extract_module_inputs(self, verilog_ams_code, module_name):
+        """Extract input port names from Verilog-AMS module."""
+        import re
+
+        # Find module declaration
+        module_pattern = rf'module\s+{module_name}\s*\((.*?)\);'
+        match = re.search(module_pattern, verilog_ams_code, re.DOTALL)
+        if not match:
+            return []
+
+        ports_text = match.group(1)
+
+        # Find input declarations
+        input_pattern = r'input\s+electrical\s+(\w+)'
+        inputs = re.findall(input_pattern, ports_text)
+
+        return inputs
+
+    def _extract_input_sources(self, spice_netlist, input_nodes):
+        """Extract voltage source definitions for input nodes from SPICE netlist."""
+        if not input_nodes:
+            return ""
+
+        sources = []
+        for line in spice_netlist.split('\n'):
+            line_stripped = line.strip()
+            if not line_stripped or line_stripped.startswith('*'):
+                continue
+
+            # Check if this is a voltage source connected to one of our input nodes
+            # Format: Vxxx node1 node2 ...
+            if line_stripped[0].upper() == 'V':
+                parts = line_stripped.split()
+                if len(parts) >= 3:
+                    # Check if any input node appears in this source definition
+                    for input_node in input_nodes:
+                        if input_node in parts:
+                            sources.append(line_stripped)
+                            break
+
+        return '\n'.join(sources)
+
+    def _run_transient_osdi(self, osdi_file, module_name, input_nodes, output_nodes,
+                            spice_netlist, tstop, tstep):
+        """Run transient simulation on compiled OSDI model with input stimuli."""
         if not osdi_file or not Path(osdi_file).exists():
             return None
 
-        # Create testbench netlist for autonomous oscillator (no inputs)
-        # Instantiation for autonomous modules (no inputs, only outputs)
+        # Defaults
         if not output_nodes:
             output_nodes = ['out']
+        if not input_nodes:
+            input_nodes = []
 
-        output_list = ' '.join(output_nodes)
+        # Extract input sources from SPICE netlist
+        input_sources = self._extract_input_sources(spice_netlist, input_nodes)
+
+        # Build node list: outputs first, then inputs
+        # OSDI module port order: output output... input input...
+        node_list = ' '.join(output_nodes + input_nodes)
 
         testbench = f"""* Transient testbench for {module_name}
 
@@ -204,12 +273,15 @@ class OSDIEquivalenceChecker(BaseChecker):
 pre_osdi {osdi_file}
 .endc
 
+* Input voltage sources (from original SPICE netlist)
+{input_sources}
+
 * Define model (maps model name to Verilog-A module name)
-.model osc_model {module_name}
+.model {module_name}_model {module_name}
 
 * OSDI device instance (N prefix for OSDI models)
-* Format: N<name> <nodes...> <model_name>
-Nmodel {output_list} osc_model
+* Format: N<name> <output_nodes...> <input_nodes...> <model_name>
+Nmodel {node_list} {module_name}_model
 
 .TRAN {tstep} {tstop}
 

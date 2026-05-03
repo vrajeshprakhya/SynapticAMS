@@ -1,0 +1,3 @@
+* Test Fixed SPICE SerDes
+.include /tmp/flattened_serdes.cir
+.end

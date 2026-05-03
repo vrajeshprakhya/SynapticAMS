@@ -1,0 +1,30 @@
+* Test SerDes RX System Model
+
+* Load OSDI library
+.control
+pre_osdi serdes_rx_system.osdi
+.endc
+
+* Input signals (differential 1GHz sine waves)
+Vp tx_p 0 DC 0.9 SIN(0.9 0.1 1G)
+Vn tx_n 0 DC 0.9 SIN(0.9 -0.1 1G 0 0 180)
+
+* Define model
+.model serdes_model serdes_rx_system
+
+* OSDI device (output first, then inputs)
+Nserdes out tx_p tx_n serdes_model
+
+* Load
+Rload out 0 1k
+
+* Transient analysis
+.tran 10p 5n
+
+.control
+run
+print v(tx_p) v(tx_n) v(out)
+quit
+.endc
+
+.end
