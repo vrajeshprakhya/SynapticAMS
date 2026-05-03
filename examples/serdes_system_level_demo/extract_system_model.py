@@ -40,16 +40,20 @@ def extract_system_level_model(netlist_path, output_dir):
     print("\n[2/4] Running 2D DC sweep...")
     runner = NgspiceRunner()
 
+    # Sweep range must keep CTLE MOSFETs biased.
+    # CTLE gate needs Vgs > Vth (0.45V) + Vs (~0.15V) → Vg > ~0.6V.
+    # At DC the channel series resistance (~12Ω) is negligible vs gate impedance
+    # (∞), so Vg ≈ Vsrc. Sweep 0.6–1.4V: 9 points per axis = 81-point 2D grid.
     sweep_plan = {
         'type': 'dc_sweep_2d',
         'sweep_var_1': 'tx_p_src',
         'sweep_var_2': 'tx_n_src',
-        'start_1': 0.0,
-        'stop_1': 1.8,
-        'step_1': 0.2,  # 10 points
-        'start_2': 0.0,
-        'stop_2': 1.8,
-        'step_2': 0.2,  # 10 points
+        'start_1': 0.6,
+        'stop_1': 1.4,
+        'step_1': 0.1,  # 9 points
+        'start_2': 0.6,
+        'stop_2': 1.4,
+        'step_2': 0.1,  # 9 points
         'observe': ['final_out']
     }
 
@@ -70,12 +74,12 @@ def extract_system_level_model(netlist_path, output_dir):
         print(f"  ✗ 2D sweep failed: {e}")
         print("\n  Falling back to 1D sweep (single input)...")
 
-        # Fallback: 1D sweep on first input only
+        # Fallback: 1D sweep on first input only, using same biased range
         sweep_plan_1d = {
             'sweep_var': 'tx_p_src',
-            'start': 0.0,
-            'stop': 1.8,
-            'step': 0.05,  # 37 points
+            'start': 0.6,
+            'stop': 1.4,
+            'step': 0.025,  # 33 points
             'observe': ['final_out']
         }
 
@@ -84,6 +88,12 @@ def extract_system_level_model(netlist_path, output_dir):
             x1 = results_1d['tx_p_src']
             z = results_1d['final_out']
             x2 = None  # Single input only
+
+            if len(x1) < 2:
+                raise ValueError(
+                    f"DC sweep returned only {len(x1)} point(s) — "
+                    "circuit may not converge or node name mismatch"
+                )
 
             print(f"  ✓ Completed: {len(x1)} points")
 

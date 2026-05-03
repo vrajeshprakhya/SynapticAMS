@@ -1,0 +1,33 @@
+services:
+  demo:
+    build:
+      context: .
+      # linux/amd64 so OpenVAF (x86_64-only) binary works on Mac and Linux servers
+      platforms:
+        - linux/amd64
+    image: synapticams-demo
+    # Pass your Anthropic API key from the host environment:
+    #   export ANTHROPIC_API_KEY=sk-ant-...
+    #   docker compose run demo
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+    # Mount a host directory to persist simulation output across runs
+    volumes:
+      - ./output:/app/examples/serdes_system_level_demo/serdes_final_model
+    # Run once then exit (not a long-running service)
+    restart: "no"
+
+  # Optional: run the Streamlit web UI
+  ui:
+    build:
+      context: .
+      platforms:
+        - linux/amd64
+    image: synapticams-demo
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    ports:
+      - "8501:8501"
+    command: ["streamlit", "run", "demo/app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    restart: unless-stopped

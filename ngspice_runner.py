@@ -131,7 +131,9 @@ class NgspiceRunner:
                 upper.startswith('.AC ') or
                 upper.startswith('.PRINT ') or
                 upper.startswith('.PLOT ') or
-                upper.startswith('.PROBE ')
+                upper.startswith('.PROBE ') or
+                upper.startswith('.SAVE') or   # limits available vectors; breaks print
+                upper == '.OP' or upper.startswith('.OP ')  # adds extra 1-pt analysis
             )
 
             # Keep line if it's not .END or an analysis directive

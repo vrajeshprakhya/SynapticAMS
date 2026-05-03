@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+output_*
+my_demo_results
+.claude
