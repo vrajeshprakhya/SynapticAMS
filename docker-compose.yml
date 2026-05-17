@@ -2,16 +2,16 @@ services:
   demo:
     build:
       context: .
-      # linux/amd64 so OpenVAF (x86_64-only) binary works on Mac and Linux servers
-      platforms:
-        - linux/amd64
     image: synapticams-demo
-    # Pass your Anthropic API key from the host environment:
-    #   export ANTHROPIC_API_KEY=sk-ant-...
-    #   docker compose run demo
+    # AI backend — Ollama (local) takes priority over Anthropic API.
+    # Make sure Ollama is running on the host before starting: `ollama serve`
+    # Mac/Windows Docker Desktop: host.docker.internal resolves automatically.
+    # WSL2 plain Docker Engine: set OLLAMA_BASE_URL to the WSL2 host IP
+    #   (e.g. export OLLAMA_BASE_URL=http://172.x.x.x:11434) before running.
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5-coder:7b}
     # Mount a host directory to persist simulation output across runs
     volumes:
       - ./output:/app/examples/serdes_system_level_demo/serdes_final_model
@@ -22,11 +22,11 @@ services:
   ui:
     build:
       context: .
-      platforms:
-        - linux/amd64
     image: synapticams-demo
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5-coder:7b}
     ports:
       - "8501:8501"
     command: ["streamlit", "run", "demo/app.py", "--server.address=0.0.0.0", "--server.port=8501"]

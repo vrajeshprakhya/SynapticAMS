@@ -89,22 +89,14 @@ def main():
     print_step(2, 3, "Running AI refinement with validation...")
 
     import os
+    from ai_agent import create_agent
 
-    # Agent selection: Anthropic API > Ollama (OLLAMA_BASE_URL env) > skip
-    api_key      = os.getenv('ANTHROPIC_API_KEY')
-    ollama_url   = os.getenv('OLLAMA_BASE_URL')
-    agent        = None
-
-    if api_key:
-        print_info("Using Anthropic API for AI refinement")
-        from ai_agent import ClaudeAgent
-        agent = ClaudeAgent(model="claude-sonnet-4-6")
-    elif ollama_url:
-        print_info(f"Using Ollama at {ollama_url} for AI refinement")
-        from ai_agent import OllamaAgent
-        agent = OllamaAgent(model="llama3.2:3b", base_url=ollama_url)
-    else:
-        print_warning("No ANTHROPIC_API_KEY or OLLAMA_BASE_URL set — skipping AI refinement, using baseline model")
+    agent = None
+    try:
+        agent = create_agent()
+        print_info(f"Using AI backend: {type(agent).__name__}/{agent.model}")
+    except RuntimeError as e:
+        print_warning(f"No AI backend available — skipping AI refinement, using baseline model\n  ({e})")
 
     # Read netlist
     netlist_text = netlist_path.read_text()
@@ -134,7 +126,23 @@ def main():
     else:
         system_prompt = """You are a Verilog-AMS expert specializing in circuit behavioral modeling.
 Your task is to refine numerically-fitted Verilog-AMS models to improve accuracy.
-CRITICAL: Output ONLY valid Verilog-AMS code. No explanations, no text before or after the module."""
+The code will be compiled with OpenVAF (a strict subset of Verilog-AMS).
+
+=== OpenVAF HARD CONSTRAINTS — violating these causes compile failure ===
+❌ NO arrays of any kind: no `real x[N]`, no `real x[N][M]`
+❌ NO `M_PI` macro — use 3.141592653589793 directly
+❌ NO laplace_nd(), laplace_zd(), zi_nd(), or any filter functions
+❌ NO $random, white_noise(), flicker_noise()
+❌ NO variable declarations inside `analog begin` blocks
+
+=== ALLOWED — use these instead ===
+✅ Simple algebraic expressions: +, -, *, /, pow(), exp(), tanh(), abs()
+✅ ddt(), idt() for dynamics
+✅ if/else for piecewise models
+✅ `parameter real` at module scope (NOT inside analog begin)
+✅ `real` variables at module scope (NOT inside analog begin)
+
+CRITICAL: Output ONLY valid Verilog-AMS code. No markdown, no explanations."""
 
         user_prompt = f"""Refine this baseline Verilog-AMS model to improve accuracy.
 
@@ -153,14 +161,13 @@ This model represents the COMPLETE SerDes RX system:
 - Output: final_out (recovered signal)
 - System includes: Channel → CTLE → VGA → Summer
 
-The baseline model is a simple bilinear fit that may not capture the full system behavior.
-
 Instructions:
-1. Analyze the SPICE netlist to understand the complete signal path
-2. Improve the transfer function to better represent the system behavior
-3. Consider the differential nature of the inputs (tx_p_src, tx_n_src)
-4. Ensure OpenVAF can compile the code
-5. Output ONLY valid Verilog-AMS code
+1. The output is driven by the DIFFERENTIAL input: V_diff = V(tx_p_src) - V(tx_n_src)
+2. Model the nonlinear transfer function using tanh() saturation:
+   V_out = voh * tanh(gain * (V_diff - vth)) + vbias
+3. Use ONLY `parameter real` and `real` at module scope — NO arrays
+4. Keep the module port list identical to the baseline
+5. Declare all `real` variables at module scope (before `analog begin`)
 
 Output the refined module code ONLY. No explanations."""
 
@@ -229,29 +236,40 @@ Output the refined module code ONLY. No explanations."""
                 # PASS 3: Error correction
                 print(f"{Colors.CYAN}Pass 3:{Colors.END} AI error correction...", end="", flush=True)
 
-                correction_prompt = f"""The refined model failed validation. Please fix the errors.
+                correction_prompt = f"""Your previous Verilog-AMS model FAILED OpenVAF compilation. Fix it.
 
-SPICE Netlist (ground truth):
-```
-{netlist_text}
-```
+=== COMPILATION FAILURE ===
+{error_msg if error_msg else f"Poor accuracy: max_error={metrics.get('max_abs_error', 'N/A')}, correlation={metrics.get('correlation', 'N/A')}"}
 
-Your Previous Attempt (FAILED):
+=== YOUR FAILED CODE ===
 ```
 {pass1_va}
 ```
 
-Validation Error:
-{error_msg if error_msg else f"Poor accuracy: max_error={metrics.get('max_abs_error', 'N/A')}, correlation={metrics.get('correlation', 'N/A')}"}
+=== COMMON FIX: If you used arrays, remove them ===
+OpenVAF does NOT support arrays. If your code has `real name[N]` or `real name[N][M]`,
+replace with an algebraic expression like:
+  V(out) <+ vbias + vamp * tanh(gain * (V(inp) - V(inn) - vth));
 
-Instructions:
-1. If compilation error: fix syntax/semantic issues
-2. If accuracy error: improve transfer function accuracy
-3. If timeout: simplify the model
-4. Remember this is a SYSTEM-LEVEL model (complete SerDes RX)
-5. Output ONLY the corrected module code
+=== WRITE A SIMPLE ALGEBRAIC MODEL ===
+Use this structure (guaranteed to compile):
+  `include "disciplines.vams"
+  module serdes_rx_system(final_out, tx_p_src, tx_n_src);
+    inout electrical final_out;
+    input electrical tx_p_src, tx_n_src;
+    parameter real vbias = 0.9;   // output midpoint
+    parameter real vamp  = 0.8;   // output swing
+    parameter real gain  = 5.0;   // differential gain
+    parameter real vth   = 0.0;   // differential threshold
+    real v_diff;
+    analog begin
+      v_diff = V(tx_p_src) - V(tx_n_src);
+      V(final_out) <+ vbias + vamp * tanh(gain * (v_diff - vth));
+    end
+  endmodule
 
-Output the corrected Verilog-AMS module code ONLY. No explanations."""
+Tune the parameter values to match the SerDes RX behavior.
+Output ONLY the corrected Verilog-AMS module. No explanations."""
 
                 try:
                     pass3_va = agent.chat(system_prompt, correction_prompt)
@@ -314,6 +332,34 @@ Output the corrected Verilog-AMS module code ONLY. No explanations."""
     print_success(f"Final model saved: {final_path}")
     print_info(f"Source: {final_source}")
 
+    # Compile final .va → .osdi with OpenVAF
+    import subprocess, shutil
+    osdi_path = final_path.with_suffix('.osdi')
+    openvaf_bin = shutil.which("openvaf")
+    if openvaf_bin:
+        print(f"\n{Colors.BOLD}Compiling with OpenVAF...{Colors.END}")
+        try:
+            result = subprocess.run(
+                [openvaf_bin, str(final_path)],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode == 0:
+                # OpenVAF writes .osdi next to the .va file
+                if osdi_path.exists():
+                    print_success(f"OSDI compiled: {osdi_path}")
+                else:
+                    print_success(f"OpenVAF succeeded (exit 0)")
+            else:
+                print_warning(f"OpenVAF compilation failed (exit {result.returncode}):")
+                if result.stderr:
+                    print(result.stderr[:500])
+        except subprocess.TimeoutExpired:
+            print_warning("OpenVAF timed out after 120 s")
+        except Exception as e:
+            print_warning(f"OpenVAF error: {e}")
+    else:
+        print_warning("openvaf not found on PATH — skipping OSDI compilation")
+
     # Summary
     print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*80}{Colors.END}")
     print(f"{Colors.BOLD}{Colors.GREEN}System-Level Model Extraction Complete!{Colors.END}")
@@ -324,12 +370,8 @@ Output the corrected Verilog-AMS module code ONLY. No explanations."""
     print(f"  • System I/O: {', '.join(inputs)} → {', '.join(outputs)}")
     print(f"  • Models generated: 1 (not 10!)")
     print(f"  • Final model: {final_path}")
+    print(f"  • OSDI binary: {osdi_path if osdi_path.exists() else '(not compiled)'}")
     print(f"  • Source: {final_source}")
-
-    print(f"\n{Colors.BOLD}Next Steps:{Colors.END}")
-    print(f"  1. View model: cat {final_path}")
-    print(f"  2. Compile: openvaf {final_path}")
-    print(f"  3. Use in simulation: .osdi {final_path.with_suffix('.osdi')}")
 
 
 if __name__ == "__main__":

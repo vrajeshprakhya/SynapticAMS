@@ -472,8 +472,9 @@ def clean_code(text):
 # ── Ollama backend ─────────────────────────────────────────────────────
 
 class OllamaAgent:
-    DEFAULT_MODEL = "deepseek-r1:32b"
-    BASE_URL      = "http://192.168.1.34:11434"  # Remote Ollama server
+    # Read from env at module load so Docker env vars take effect
+    DEFAULT_MODEL = os.environ.get('OLLAMA_MODEL', 'qwen2.5-coder:7b')
+    BASE_URL      = os.environ.get('OLLAMA_BASE_URL', 'http://localhost:11434')
 
     def __init__(self, model=None, base_url=None, timeout=180):
         self.model    = model    or self.DEFAULT_MODEL
@@ -499,19 +500,21 @@ class OllamaAgent:
             return json.loads(resp.read())["message"]["content"]
 
     @classmethod
-    def is_available(cls, base_url=BASE_URL):
+    def is_available(cls, base_url=None):
         import urllib.request
+        url = base_url or cls.BASE_URL
         try:
-            urllib.request.urlopen(f"{base_url}/api/tags", timeout=3)
+            urllib.request.urlopen(f"{url}/api/tags", timeout=3)
             return True
         except Exception:
             return False
 
     @classmethod
-    def available_models(cls, base_url=BASE_URL):
+    def available_models(cls, base_url=None):
         import urllib.request
+        url = base_url or cls.BASE_URL
         try:
-            with urllib.request.urlopen(f"{base_url}/api/tags", timeout=3) as r:
+            with urllib.request.urlopen(f"{url}/api/tags", timeout=3) as r:
                 return [m["name"] for m in json.loads(r.read()).get("models", [])]
         except Exception:
             return []

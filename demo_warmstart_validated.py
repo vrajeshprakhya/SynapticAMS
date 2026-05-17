@@ -107,6 +107,11 @@ def fix_openvaf_compatibility(verilog_ams_code):
     # Fix 7: Replace limexp with exp
     code = re.sub(r'limexp\(', 'exp(', code)
 
+    # Fix 8: Replace `output electrical` with `inout electrical`
+    # OpenVAF requires output ports that are also read (e.g. V(port)) to be inout.
+    # AI models consistently generate `output` but the Thevenin driver pattern needs inout.
+    code = re.sub(r'\boutput\s+electrical\b', 'inout electrical', code)
+
     return code
 
 
@@ -138,13 +143,14 @@ def extract_module_ports(verilog_code: str) -> Tuple[list, list]:
         # Remove trailing comma
         line = line.rstrip(',')
 
-        # Match: input/output electrical <name>
-        port_match = re.match(r'(input|output)\s+electrical\s+(\w+)', line)
+        # Match: input/output/inout electrical <name>
+        # inout ports that are driven by the model are treated as outputs
+        port_match = re.match(r'(input|output|inout)\s+electrical\s+(\w+)', line)
         if port_match:
             direction, name = port_match.groups()
             if direction == 'input':
                 inputs.append(name)
-            elif direction == 'output':
+            else:  # output or inout
                 outputs.append(name)
 
     return inputs, outputs
@@ -315,7 +321,6 @@ def run_ai_refinement_with_validation(netlist_path: Path,
 
     from ai_agent import create_agent
 
-    # Auto-detect AI backend (Anthropic or Ollama)
     agent = create_agent()
     print_info(f"Using AI backend: {type(agent).__name__}/{agent.model}")
 
@@ -330,18 +335,6 @@ def run_ai_refinement_with_validation(netlist_path: Path,
 
     refined_dir = output_dir / "refined"
     refined_dir.mkdir(parents=True, exist_ok=True)
-
-    # Use Anthropic API if available
-    import os
-    api_key = os.getenv('ANTHROPIC_API_KEY')
-    if api_key:
-        print_info(f"Using Anthropic API for AI refinement")
-        from ai_agent import ClaudeAgent
-        agent = ClaudeAgent(model="claude-sonnet-4-20250514")
-    else:
-        print_info(f"Using Ollama backend for AI refinement")
-        from ai_agent import OllamaAgent
-        agent = OllamaAgent(model="llama3.2:3b")
 
     validation_report = []
     final_modules = {}

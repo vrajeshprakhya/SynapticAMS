@@ -138,7 +138,7 @@ class VerilogAMSGenerator:
 
         # Module declaration
         code += f"module {module_name}(\n"
-        code += f"    output electrical {output_clean},\n"
+        code += f"    inout electrical {output_clean},\n"
         code += f"    input electrical {input_clean}\n"
         code += ");\n\n"
 
@@ -303,7 +303,7 @@ class VerilogAMSGenerator:
 
         # Module declaration
         code += f"module {module_name}(\n"
-        code += f"    output electrical {output_clean},\n"
+        code += f"    inout electrical {output_clean},\n"
         code += f"    input electrical {input_clean}\n"
         code += ");\n\n"
 
@@ -418,7 +418,7 @@ class VerilogAMSGenerator:
 
         # Module declaration
         code += f"module {module_name}(\n"
-        code += f"    output electrical {output_clean},\n"
+        code += f"    inout electrical {output_clean},\n"
         code += f"    input electrical {input_clean}\n"
         code += ");\n\n"
 
@@ -490,7 +490,7 @@ class VerilogAMSGenerator:
 
         # Module declaration - oscillators have no inputs, only output
         code += f"module {module_name}(\n"
-        code += f"    output electrical {output_clean}\n"
+        code += f"    inout electrical {output_clean}\n"
         code += ");\n\n"
 
         # Parameters
@@ -660,7 +660,7 @@ class VerilogAMSGenerator:
         # Generate module
         code = header + f"""module {module_name} (
   {inputs_decl},
-  output electrical {output_clean}
+  inout electrical {output_clean}
 );
 
   // Dynamic model parameters
@@ -795,7 +795,7 @@ endmodule
 
         # Module declaration
         code += f"module {module_name}(\n"
-        code += f"    output electrical {output_clean},\n"
+        code += f"    inout electrical {output_clean},\n"
         code += f"    input electrical {input1},\n"
         code += f"    input electrical {input2}\n"
         code += ");\n\n"
@@ -869,119 +869,98 @@ endmodule
 
         # Module declaration
         code += f"module {module_name}(\n"
-        code += f"    output electrical {output_clean},\n"
+        code += f"    inout electrical {output_clean},\n"
         code += f"    input electrical {input1},\n"
         code += f"    input electrical {input2}\n"
         code += ");\n\n"
 
-        # Table parameters
+        # Table parameters — real only, no integer types (avoid llround on arm64 LLVM)
         code += f"    // 2D Lookup table parameters\n"
         code += f"    parameter real x1_min = {x1.min():.12e};\n"
         code += f"    parameter real x1_max = {x1.max():.12e};\n"
-        code += f"    parameter integer n1 = {n1};\n"
         code += f"    parameter real x2_min = {x2.min():.12e};\n"
         code += f"    parameter real x2_max = {x2.max():.12e};\n"
-        code += f"    parameter integer n2 = {n2};\n"
-        code += "    parameter real output_resistance = 1.0;  // Output resistance (Ohms) for numerical stability\n"
+        code += "    parameter real output_resistance = 1.0;\n"
         code += "\n"
 
-        # Since OpenVAF doesn't support arrays, embed table as individual parameters
-        code += f"    // Embedded lookup table data as individual parameters ({n1}×{n2} grid)\n"
-
-        # Flatten z in row-major order and create individual parameters
+        # Embed table as real parameters
+        code += f"    // Embedded lookup table data as real parameters ({n1}×{n2} grid, row-major)\n"
         flat_z = z.ravel()
         for i in range(len(flat_z)):
             code += f"    parameter real lut_{i} = {flat_z[i]:.12e};\n"
         code += "\n"
 
-        # Analog block with bilinear interpolation
+        # Analog block — purely real arithmetic, no integer types
+        # Uses continuous if/else region tree to avoid $floor→integer assignment
+        # which generates i32=llround(f64) LLVM IR unsupported on arm64.
         code += "    analog begin : analog_block\n"
         code += "        real v_ideal;\n"
         code += "        real v1, v2;\n"
         code += "        real i1_real, i2_real;\n"
-        code += "        integer i1, i2, i1p, i2p;\n"
-        code += "        integer idx00, idx01, idx10, idx11;\n"
         code += "        real w1, w2;\n"
         code += "        real z00, z01, z10, z11;\n"
         code += "        real z0, z1;\n\n"
 
-        code += "        // Read input voltages\n"
+        code += "        // Read and clamp input voltages\n"
         code += f"        v1 = V({input1});\n"
-        code += f"        v2 = V({input2});\n\n"
-
-        code += "        // Clamp to table bounds\n"
+        code += f"        v2 = V({input2});\n"
         code += "        if (v1 < x1_min) v1 = x1_min;\n"
         code += "        if (v1 > x1_max) v1 = x1_max;\n"
         code += "        if (v2 < x2_min) v2 = x2_min;\n"
         code += "        if (v2 > x2_max) v2 = x2_max;\n\n"
 
-        code += "        // Compute continuous indices (with guards for constant axes)\n"
-        code += "        if (abs(x1_max - x1_min) < 1e-12)\n"
-        code += "            i1_real = 0.0;  // Constant axis\n"
-        code += "        else\n"
-        code += "            i1_real = (v1 - x1_min) * (n1 - 1) / (x1_max - x1_min);\n\n"
-        code += "        if (abs(x2_max - x2_min) < 1e-12)\n"
-        code += "            i2_real = 0.0;  // Constant axis\n"
-        code += "        else\n"
-        code += "            i2_real = (v2 - x2_min) * (n2 - 1) / (x2_max - x2_min);\n\n"
+        code += "        // Continuous fractional indices\n"
+        if abs(x1.max() - x1.min()) < 1e-12:
+            code += "        i1_real = 0.0;\n"
+        else:
+            code += f"        i1_real = (v1 - x1_min) * {float(n1 - 1)} / (x1_max - x1_min);\n"
+        if abs(x2.max() - x2.min()) < 1e-12:
+            code += "        i2_real = 0.0;\n"
+        else:
+            code += f"        i2_real = (v2 - x2_min) * {float(n2 - 1)} / (x2_max - x2_min);\n"
+        code += "\n"
 
-        code += "        // Integer indices (floor)\n"
-        code += "        i1 = $floor(i1_real);\n"
-        code += "        i2 = $floor(i2_real);\n\n"
+        # Build if/else tree selecting the bilinear cell using real comparisons.
+        # Outer level: row band (i1), inner level: column band (i2).
+        # w1 and w2 are fractional parts within the selected cell.
+        code += "        // Bilinear interpolation: select cell via continuous if/else\n"
+        for i1_row in range(n1 - 1):
+            # Outer branch for row
+            if i1_row == 0:
+                code += f"        if (i1_real < 1.0) begin\n"
+            elif i1_row < n1 - 2:
+                code += f"        end else if (i1_real < {float(i1_row + 1)}) begin\n"
+            else:
+                code += f"        end else begin\n"
+            code += f"            w1 = i1_real - {float(i1_row)};\n"
 
-        code += "        // Ensure indices stay in bounds\n"
-        code += "        if (i1 < 0) i1 = 0;\n"
-        code += "        if (i1 >= n1 - 1) i1 = n1 - 2;\n"
-        code += "        if (i2 < 0) i2 = 0;\n"
-        code += "        if (i2 >= n2 - 1) i2 = n2 - 2;\n\n"
+            for i2_col in range(n2 - 1):
+                idx00 = i1_row * n2 + i2_col
+                idx01 = i1_row * n2 + i2_col + 1
+                idx10 = (i1_row + 1) * n2 + i2_col
+                idx11 = (i1_row + 1) * n2 + i2_col + 1
+                # Inner branch for column
+                if i2_col == 0:
+                    code += f"            if (i2_real < 1.0) begin\n"
+                elif i2_col < n2 - 2:
+                    code += f"            end else if (i2_real < {float(i2_col + 1)}) begin\n"
+                else:
+                    code += f"            end else begin\n"
+                code += f"                w2 = i2_real - {float(i2_col)};\n"
+                code += f"                z00 = lut_{idx00}; z01 = lut_{idx01};\n"
+                code += f"                z10 = lut_{idx10}; z11 = lut_{idx11};\n"
 
-        code += "        i1p = i1 + 1;\n"
-        code += "        i2p = i2 + 1;\n\n"
+            code += "            end\n"  # close inner if/else
 
-        code += "        // Interpolation weights\n"
-        code += "        w1 = i1_real - i1;\n"
-        code += "        w2 = i2_real - i2;\n\n"
-
-        code += "        // Compute flat indices (row-major)\n"
-        code += "        idx00 = i1 * n2 + i2;\n"
-        code += "        idx01 = i1 * n2 + i2p;\n"
-        code += "        idx10 = i1p * n2 + i2;\n"
-        code += "        idx11 = i1p * n2 + i2p;\n\n"
-
-        # Generate lookup function using case statement
-        code += "        // Lookup corner values using case statement\n"
-        code += "        case (idx00)\n"
-        for i in range(len(flat_z)):
-            code += f"            {i}: z00 = lut_{i};\n"
-        code += f"            default: z00 = lut_0;\n"
-        code += "        endcase\n\n"
-
-        code += "        case (idx01)\n"
-        for i in range(len(flat_z)):
-            code += f"            {i}: z01 = lut_{i};\n"
-        code += f"            default: z01 = lut_0;\n"
-        code += "        endcase\n\n"
-
-        code += "        case (idx10)\n"
-        for i in range(len(flat_z)):
-            code += f"            {i}: z10 = lut_{i};\n"
-        code += f"            default: z10 = lut_0;\n"
-        code += "        endcase\n\n"
-
-        code += "        case (idx11)\n"
-        for i in range(len(flat_z)):
-            code += f"            {i}: z11 = lut_{i};\n"
-        code += f"            default: z11 = lut_0;\n"
-        code += "        endcase\n\n"
+        code += "        end\n\n"  # close outer if/else
 
         code += "        // Bilinear interpolation\n"
         code += "        z0 = z00 * (1.0 - w2) + z01 * w2;\n"
         code += "        z1 = z10 * (1.0 - w2) + z11 * w2;\n"
         code += "        v_ideal = z0 * (1.0 - w1) + z1 * w1;\n\n"
 
-        code += "        // Use current source with output resistance (Thevenin equivalent)\n"
+        code += "        // Thevenin equivalent output\n"
         code += f"        I({output_clean}) <+ (v_ideal - V({output_clean})) / output_resistance;\n"
-
         code += "    end\n"
         code += "endmodule\n"
 
